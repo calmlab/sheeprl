@@ -165,30 +165,33 @@ def train(
     pr = TwoHotEncodingDistribution(world_model.reward_model(latent_states), dims=1)
 
     # Compute the distribution over the action
-    prev_latent_states = latent_states[:-1]
-    encoded_obs = embedded_obs[1:]  # t 시점의 observation
 
     # action model 내부에서 return으로 분포를 만들어줌
-    action_logits, pa = world_model.action_model(prev_latent_states, encoded_obs)
+    action_logits, _ = world_model.action_model(latent_states, embedded_obs)
+    if is_continuous:
+        pa = Independent(Normal(action_logits[0]), 1)
+    else:
+        pa = OneHotCategorical(action_logits[0])
+
     # Compute the distribution over the terminal steps, if required
     pc = Independent(BernoulliSafeMode(logits=world_model.continue_model(latent_states)), 1)
     continues_targets = 1 - data["terminated"]
-    continues = torch.cat((continues_targets, pc.mode[1:]))
 
     # Compute the distribution over the values
-    pv = TwoHotEncodingDistribution(world_model.value_model(latent_states), dims=1)
+    pv = TwoHotEncodingDistribution(world_model.value_model(latent_states.detach()), dims=1)
     # Estimate lambda-values
     lambda_values = compute_lambda_values(
-        pr.mean[1:],
-        pv.mean[1:],
-        continues[1:] * cfg.algo.gamma,
+        pr.mean,
+        pv.mean,
+        pc.mode * cfg.algo.gamma,
         lmbda=cfg.algo.lmbda,
     )
     predicted_target_values = TwoHotEncodingDistribution(
-        target_critic(latent_states.detach()[:-1]), dims=1
+        target_critic(latent_states.detach()), dims=1
     ).mean
     with torch.no_grad():
-        discount = torch.cumprod(continues * cfg.algo.gamma, dim=0) / cfg.algo.gamma
+        discount = torch.cumprod(pc.mode * cfg.algo.gamma, dim=0) / cfg.algo.gamma
+    
     # Reshape posterior and prior logits to shape [B, T, 32, 32]
     priors_logits = priors_logits.view(*priors_logits.shape[:-1], stochastic_size, discrete_size)
     posteriors_logits = posteriors_logits.view(*posteriors_logits.shape[:-1], stochastic_size, discrete_size)
@@ -205,7 +208,7 @@ def train(
         predicted_target_values,
         discount,
         pa,
-        batch_actions,
+        batch_actions, # 
         priors_logits,
         posteriors_logits,
         cfg.algo.world_model.kl_dynamic,
@@ -282,7 +285,6 @@ def train(
         continues[1:] * cfg.algo.gamma,
         lmbda=cfg.algo.lmbda,
     )
-
     # Compute the discounts to multiply the lambda values to
     with torch.no_grad():
         discount = torch.cumprod(continues * cfg.algo.gamma, dim=0) / cfg.algo.gamma

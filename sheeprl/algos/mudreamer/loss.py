@@ -77,7 +77,7 @@ def reconstruction_loss(
     # Compute the distribution over the values
     value_loss = -pv.log_prob(lambda_values.detach())
     value_loss = value_loss - pv.log_prob(predicted_target_values.detach())
-    value_loss = torch.mean(value_loss * discount[:-1].squeeze(-1))
+    value_loss = value_loss * discount.squeeze(-1)
 
     # TODO
     action_loss = -pa.log_prob(actions)
