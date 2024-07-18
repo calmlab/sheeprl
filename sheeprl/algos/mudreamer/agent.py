@@ -723,7 +723,160 @@ class PlayerDV3(nn.Module):
         actions, _ = self.actor(torch.cat((self.stochastic_state, self.recurrent_state), -1), greedy, mask)
         self.actions = torch.cat(actions, -1)
         return actions
+    
 
+class ActionPredictor(nn.Module):
+    """
+    The wrapper class of the Dreamer_v2 Actor model.
+
+    Args:
+        latent_state_size (int): the dimension of the latent state (stochastic size + recurrent_state_size).
+        actions_dim (Sequence[int]): the dimension in output of the actor.
+            The number of actions if continuous, the dimension of the action if discrete.
+        is_continuous (bool): whether or not the actions are continuous.
+        distribution_cfg (Dict[str, Any]): The configs of the distributions.
+        init_std (float): the amount to sum to the standard deviation.
+            Default to 0.0.
+        min_std (float): the minimum standard deviation for the actions.
+            Default to 1.0.
+        max_std (float): the maximum standard deviation for the actions.
+            Default to 1.0.
+        dense_units (int): the dimension of the hidden dense layers.
+            Default to 1024.
+        activation (int): the activation function to apply after the dense layers.
+            Default to nn.SiLU.
+        mlp_layers (int): the number of dense layers.
+            Default to 5.
+        layer_norm_cls (Callable[..., nn.Module]): the layer norm to apply after the input projection.
+            Defaults to LayerNorm.
+        layer_norm_kw (Dict[str, Any]): the kwargs of the layer norm.
+            Default to {"eps": 1e-3}.
+        unimix: (float, optional): the percentage of uniform distribution to inject into the categorical
+            distribution over actions, i.e. given some logits `l` and probabilities `p = softmax(l)`,
+            then `p = (1 - self.unimix) * p + self.unimix * unif`,
+            where `unif = `1 / self.discrete`.
+            Defaults to 0.01.
+        action_clip (float): the action clip parameter.
+            Default to 1.0.
+    """
+
+    def __init__(
+        self,
+        latent_state_size: int,
+        actions_dim: Sequence[int],
+        is_continuous: bool,
+        distribution_cfg: Dict[str, Any],
+        init_std: float = 0.0,
+        min_std: float = 1.0,
+        max_std: float = 1.0,
+        dense_units: int = 1024,
+        activation: nn.Module = nn.SiLU,
+        mlp_layers: int = 5,
+        layer_norm_cls: Callable[..., nn.Module] = LayerNorm,
+        layer_norm_kw: Dict[str, Any] = {"eps": 1e-3},
+        unimix: float = 0.01,
+        action_clip: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.distribution_cfg = distribution_cfg
+        self.distribution = distribution_cfg.get("type", "auto").lower()
+        if self.distribution not in ("auto", "normal", "tanh_normal", "discrete", "scaled_normal"):
+            raise ValueError(
+                "The distribution must be on of: `auto`, `discrete`, `normal`, `tanh_normal` and `scaled_normal`. "
+                f"Found: {self.distribution}"
+            )
+        if self.distribution == "discrete" and is_continuous:
+            raise ValueError("You have choose a discrete distribution but `is_continuous` is true")
+        if self.distribution == "auto":
+            if is_continuous:
+                self.distribution = "scaled_normal"
+            else:
+                self.distribution = "discrete"
+        self.model = MLP(
+            input_dims=latent_state_size,
+            output_dim=None,
+            hidden_sizes=[dense_units] * mlp_layers,
+            activation=activation,
+            flatten_dim=None,
+            layer_args={"bias": layer_norm_cls == nn.Identity},
+            norm_layer=layer_norm_cls,
+            norm_args={**layer_norm_kw, "normalized_shape": dense_units},
+        )
+        if is_continuous:
+            self.mlp_heads = nn.ModuleList([nn.Linear(dense_units, np.sum(actions_dim) * 2)])
+        else:
+            self.mlp_heads = nn.ModuleList([nn.Linear(dense_units, action_dim) for action_dim in actions_dim])
+        self.actions_dim = actions_dim
+        self.is_continuous = is_continuous
+        self.init_std = init_std
+        self.min_std = min_std
+        self.max_std = max_std
+        self._unimix = unimix
+        self._action_clip = action_clip
+
+    def forward(
+        self, state: Tensor, greedy: bool = False, mask: Optional[Dict[str, Tensor]] = None
+    ) -> Tuple[Sequence[Tensor], Sequence[Distribution]]:
+        """
+        Call the forward method of the actor model and reorganizes the result with shape (batch_size, *, num_actions),
+        where * means any number of dimensions including None.
+
+        Args:
+            state (Tensor): the current state of shape (batch_size, *, stochastic_size + recurrent_state_size).
+            greedy (bool): whether or not to sample the actions.
+                Default to False.
+            mask (Dict[str, Tensor], optional): the mask to use on the actions.
+                Default to None.
+
+        Returns:
+            The tensor of the actions taken by the agent with shape (batch_size, *, num_actions).
+            The distribution of the actions
+        """
+        out: Tensor = self.model(state)
+        pre_dist: List[Tensor] = [head(out) for head in self.mlp_heads]
+        if self.is_continuous:
+            mean, std = torch.chunk(pre_dist[0], 2, -1)
+            if self.distribution == "tanh_normal":
+                mean = 5 * torch.tanh(mean / 5)
+                std = F.softplus(std + self.init_std) + self.min_std
+                actions_dist = Normal(mean, std)
+                actions_dist = Independent(TransformedDistribution(actions_dist, TanhTransform()), 1)
+            elif self.distribution == "normal":
+                actions_dist = Normal(mean, std)
+                actions_dist = Independent(actions_dist, 1)
+            elif self.distribution == "scaled_normal":
+                std = (self.max_std - self.min_std) * torch.sigmoid(std + self.init_std) + self.min_std
+                dist = Normal(torch.tanh(mean), std)
+                actions_dist = Independent(dist, 1)
+            if not greedy:
+                actions = actions_dist.rsample()
+            else:
+                sample = actions_dist.sample((100,))
+                log_prob = actions_dist.log_prob(sample)
+                actions = sample[log_prob.argmax(0)].view(1, 1, -1)
+            if self._action_clip > 0.0:
+                action_clip = torch.full_like(actions, self._action_clip)
+                actions = actions * (action_clip / torch.maximum(action_clip, torch.abs(actions))).detach()
+            actions = [actions]
+            actions_dist = [actions_dist]
+        else:
+            actions_dist: List[Distribution] = []
+            actions: List[Tensor] = []
+            for logits in pre_dist:
+                actions_dist.append(OneHotCategoricalStraightThrough(logits=self._uniform_mix(logits)))
+                if not greedy:
+                    actions.append(actions_dist[-1].rsample())
+                else:
+                    actions.append(actions_dist[-1].mode)
+        return tuple(actions), tuple(actions_dist)
+
+    def _uniform_mix(self, logits: Tensor) -> Tensor:
+        if self._unimix > 0.0:
+            probs = logits.softmax(dim=-1)
+            uniform = torch.ones_like(probs) / probs.shape[-1]
+            probs = (1 - self._unimix) * probs + self._unimix * uniform
+            logits = probs_to_logits(probs)
+        return logits
 
 class Actor(nn.Module):
     """
@@ -1161,9 +1314,10 @@ def build_agent(
         },
     )
 
-
-    # TODO: action model output과 input맞추기
-    # It shares the same architecture as the actor network but takes the current encoded features 𝑥_𝑡.
+    # TODO: 
+    # It shares the same architecture as the actor network,
+    # but takes the current encoded features 𝑥_𝑡 and preceding model hidden state 𝑠_𝑡-1 as input.
+    # input의 모양이 달라야 함.
     action_ln_cls = hydra.utils.get_class(cfg.algo.actor.cls)
     action_model: Actor | MinedojoActor = action_ln_cls(
         latent_state_size=latent_state_size,
