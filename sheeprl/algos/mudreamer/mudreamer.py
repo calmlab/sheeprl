@@ -146,7 +146,6 @@ def train(
             posteriors_logits[i] = posterior_logits
     latent_states = torch.cat((posteriors.view(*posteriors.shape[:-2], -1), recurrent_states), -1)
 
-
     # Compute predictions for the observations
     reconstructed_obs: Dict[str, torch.Tensor] = world_model.observation_model(latent_states)
 
@@ -165,7 +164,6 @@ def train(
     # Compute the distribution over the rewards
     pr = TwoHotEncodingDistribution(world_model.reward_model(latent_states), dims=1)
 
-
     # action은 어떤 분포를 사용해야 하는지?
     pa = TwoHotEncodingDistribution(world_model.action_model(latent_states, batch_actions), dims=1)
 
@@ -174,6 +172,8 @@ def train(
     continues_targets = 1 - data["terminated"]
     continues = torch.cat((continues_targets, pc.mode[1:]))
 
+    # Compute the distribution over the values
+    pv = TwoHotEncodingDistribution(world_model.value_model(latent_states), dims=1)
     # Estimate lambda-values
     lambda_values = compute_lambda_values(
         pr[1:],
@@ -181,7 +181,6 @@ def train(
         continues[1:] * cfg.algo.gamma,
         lmbda=cfg.algo.lmbda,
     )
-    pv = TwoHotEncodingDistribution(world_model.value_model(latent_states), dims=1)
     predicted_target_values = TwoHotEncodingDistribution(
         target_critic(latent_states.detach()[:-1]), dims=1
     ).mean
