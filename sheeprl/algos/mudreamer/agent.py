@@ -1324,7 +1324,8 @@ def build_agent(
     # but takes the current encoded features 𝑥_𝑡 and preceding model hidden state 𝑠_𝑡-1 as input.
     # input의 모양이 달라야 함.
     action_ln_cls = hydra.utils.get_class(cfg.algo.actor.cls)
-    action_model: Actor | MinedojoActor = action_ln_cls(
+    action_model: ActionPredictor = action_ln_cls(
+        encoded_feature_size=encoder.output_dim,
         latent_state_size=latent_state_size,
         actions_dim=actions_dim,
         is_continuous=is_continuous,
