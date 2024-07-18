@@ -1323,22 +1323,22 @@ def build_agent(
     # It shares the same architecture as the actor network,
     # but takes the current encoded features 𝑥_𝑡 and preceding model hidden state 𝑠_𝑡-1 as input.
     # input의 모양이 달라야 함.
-    action_ln_cls = hydra.utils.get_class(cfg.algo.actor.cls)
+    action_ln_cls = hydra.utils.get_class(world_model_cfg.action_model.cls)
     action_model: ActionPredictor = action_ln_cls(
         encoded_feature_size=encoder.output_dim,
         latent_state_size=latent_state_size,
         actions_dim=actions_dim,
         is_continuous=is_continuous,
-        init_std=actor_cfg.init_std,
-        min_std=actor_cfg.min_std,
-        dense_units=actor_cfg.dense_units,
-        activation=hydra.utils.get_class(actor_cfg.dense_act),
-        mlp_layers=actor_cfg.mlp_layers,
+        init_std=world_model_cfg.action_model.init_std,
+        min_std=world_model_cfg.action_model.min_std,
+        dense_units=world_model_cfg.action_model.dense_units,
+        activation=hydra.utils.get_class(world_model_cfg.action_model.dense_act),
+        mlp_layers=world_model_cfg.action_model.mlp_layers,
         distribution_cfg=cfg.distribution,
-        layer_norm_cls=hydra.utils.get_class(actor_cfg.layer_norm.cls),
-        layer_norm_kw=actor_cfg.layer_norm.kw,
+        layer_norm_cls=hydra.utils.get_class(world_model_cfg.action_model.layer_norm.cls),
+        layer_norm_kw=world_model_cfg.action_model.layer_norm.kw,
         unimix=cfg.algo.unimix,
-        action_clip=actor_cfg.action_clip,
+        action_clip=world_model_cfg.action_model.action_clip,
     )
 
     discount_ln_cls = hydra.utils.get_class(world_model_cfg.discount_model.layer_norm.cls)
@@ -1437,6 +1437,8 @@ def build_agent(
     world_model.encoder = fabric.setup_module(world_model.encoder)
     world_model.observation_model = fabric.setup_module(world_model.observation_model)
     world_model.reward_model = fabric.setup_module(world_model.reward_model)
+    world_model.value_model = fabric.setup_module(world_model.value_model)
+    world_model.action_model = fabric.setup_module(world_model.action_model)
     world_model.rssm.recurrent_model = fabric.setup_module(world_model.rssm.recurrent_model)
     world_model.rssm.representation_model = fabric.setup_module(world_model.rssm.representation_model)
     world_model.rssm.transition_model = fabric.setup_module(world_model.rssm.transition_model)
@@ -1453,6 +1455,8 @@ def build_agent(
 
     # Setup the player agent with a single-device Fabric
     player.encoder = fabric_player.setup_module(player.encoder)
+    player.rssm.value_model = fabric.setup_module(world_model.value_model)
+    player.rssm.action_model = fabric.setup_module(world_model.action_model)
     player.rssm.recurrent_model = fabric_player.setup_module(player.rssm.recurrent_model)
     player.rssm.transition_model = fabric_player.setup_module(player.rssm.transition_model)
     player.rssm.representation_model = fabric_player.setup_module(player.rssm.representation_model)
