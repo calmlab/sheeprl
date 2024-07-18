@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from lightning.fabric import Fabric
 from lightning.fabric.wrappers import _FabricModule
 from torch import Tensor
-from torch.distributions import Distribution, Independent, OneHotCategorical
+from torch.distributions import Distribution, Independent, OneHotCategorical, Normal
 from torch.optim import Optimizer
 from torchmetrics import SumMetric
 
@@ -164,8 +164,13 @@ def train(
     # Compute the distribution over the rewards
     pr = TwoHotEncodingDistribution(world_model.reward_model(latent_states), dims=1)
 
-    # action은 어떤 분포를 사용해야 하는지?
-    pa = TwoHotEncodingDistribution(world_model.action_model(latent_states, batch_actions), dims=1)
+    # Compute the distribution over the action
+    prev_latent_states = latent_states[:-1]
+    encoded_obs = embedded_obs[1:]  # t 시점의 observation
+    if is_continuous:
+        pa = Independent(Normal(world_model.action_model(prev_latent_states, encoded_obs)), 1)
+    else:
+        pa = OneHotCategorical(logits=world_model.action_model(prev_latent_states, encoded_obs))
 
     # Compute the distribution over the terminal steps, if required
     pc = Independent(BernoulliSafeMode(logits=world_model.continue_model(latent_states)), 1)
