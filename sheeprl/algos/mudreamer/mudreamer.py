@@ -1,11 +1,11 @@
-"""Dreamer-V3 implementation from [https://arxiv.org/abs/2301.04104](https://arxiv.org/abs/2301.04104)
-Adapted from the original implementation from https://github.com/danijar/dreamerv3
+"""Mudreamer implementation from [https://arxiv.org/html/2405.15083v1](https://arxiv.org/html/2405.15083v1)
 """
 
 from __future__ import annotations
 
 import copy
 import os
+import time
 import warnings
 from functools import partial
 from typing import Any, Dict, Sequence
@@ -22,9 +22,9 @@ from torch.distributions import Distribution, Independent, OneHotCategorical
 from torch.optim import Optimizer
 from torchmetrics import SumMetric
 
-from sheeprl.algos.dreamer_v3.agent import WorldModel, build_agent
-from sheeprl.algos.dreamer_v3.loss import reconstruction_loss
-from sheeprl.algos.dreamer_v3.utils import Moments, compute_lambda_values, prepare_obs, test
+from sheeprl.algos.mudreamer.agent import WorldModel, build_agent
+from sheeprl.algos.mudreamer.loss import reconstruction_loss
+from sheeprl.algos.mudreamer.utils import Moments, compute_lambda_values, prepare_obs, test
 from sheeprl.data.buffers import EnvIndependentReplayBuffer, SequentialReplayBuffer
 from sheeprl.envs.wrappers import RestartOnException
 from sheeprl.utils.distribution import (
@@ -128,6 +128,7 @@ def train(
             recurrent_states[i] = recurrent_state
             priors_logits[i] = prior_logits
     else:
+
         posterior = torch.zeros(1, batch_size, stochastic_size, discrete_size, device=device)
         posteriors = torch.empty(sequence_length, batch_size, stochastic_size, discrete_size, device=device)
         posteriors_logits = torch.empty(sequence_length, batch_size, stoch_state_size, device=device)
@@ -144,6 +145,7 @@ def train(
             posteriors[i] = posterior
             posteriors_logits[i] = posterior_logits
     latent_states = torch.cat((posteriors.view(*posteriors.shape[:-2], -1), recurrent_states), -1)
+
 
     # Compute predictions for the observations
     reconstructed_obs: Dict[str, torch.Tensor] = world_model.observation_model(latent_states)
@@ -163,10 +165,28 @@ def train(
     # Compute the distribution over the rewards
     pr = TwoHotEncodingDistribution(world_model.reward_model(latent_states), dims=1)
 
+
+    # action은 어떤 분포를 사용해야 하는지?
+    pa = TwoHotEncodingDistribution(world_model.action_model(latent_states, batch_actions), dims=1)
+
     # Compute the distribution over the terminal steps, if required
     pc = Independent(BernoulliSafeMode(logits=world_model.continue_model(latent_states)), 1)
     continues_targets = 1 - data["terminated"]
+    continues = torch.cat((continues_targets, pc.mode[1:]))
 
+    # Estimate lambda-values
+    lambda_values = compute_lambda_values(
+        pr[1:],
+        pv[1:],
+        continues[1:] * cfg.algo.gamma,
+        lmbda=cfg.algo.lmbda,
+    )
+    pv = TwoHotEncodingDistribution(world_model.value_model(latent_states), dims=1)
+    predicted_target_values = TwoHotEncodingDistribution(
+        target_critic(latent_states.detach()[:-1]), dims=1
+    ).mean
+    with torch.no_grad():
+        discount = torch.cumprod(continues * cfg.algo.gamma, dim=0) / cfg.algo.gamma
     # Reshape posterior and prior logits to shape [B, T, 32, 32]
     priors_logits = priors_logits.view(*priors_logits.shape[:-1], stochastic_size, discrete_size)
     posteriors_logits = posteriors_logits.view(*posteriors_logits.shape[:-1], stochastic_size, discrete_size)
@@ -178,6 +198,12 @@ def train(
         batch_obs,
         pr,
         data["rewards"],
+        pv,
+        lambda_values,
+        predicted_target_values,
+        discount,
+        pa,
+        batch_actions,
         priors_logits,
         posteriors_logits,
         cfg.algo.world_model.kl_dynamic,
@@ -359,6 +385,9 @@ def train(
 
 @register_algorithm()
 def main(fabric: Fabric, cfg: Dict[str, Any]):
+    whole_time = time.time()
+    whole_interaction_time = 0
+    whole_training_time = 0
     device = fabric.device
     rank = fabric.global_rank
     world_size = fabric.world_size
@@ -582,7 +611,6 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                         real_actions = (
                             torch.stack([real_act.argmax(dim=-1) for real_act in real_actions], dim=-1).cpu().numpy()
                         )
-
                 step_data["actions"] = actions.reshape((1, cfg.env.num_envs, -1))
                 rb.add(step_data, validate_args=cfg.buffer.validate_args)
 
@@ -591,6 +619,10 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                 )
                 dones = np.logical_or(terminated, truncated).astype(np.uint8)
 
+
+
+
+            start = time.time()
             step_data["is_first"] = np.zeros_like(step_data["terminated"])
             if "restart_on_exception" in infos:
                 for i, agent_roe in enumerate(infos["restart_on_exception"]):
@@ -661,6 +693,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
             ratio_steps = policy_step - prefill_steps * policy_steps_per_iter
             per_rank_gradient_steps = ratio(ratio_steps / world_size)
             if per_rank_gradient_steps > 0:
+                start = time.time()
                 local_data = rb.sample_tensors(
                     cfg.algo.per_rank_batch_size,
                     sequence_length=cfg.algo.per_rank_sequence_length,
@@ -697,7 +730,6 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                         )
                         cumulative_per_rank_gradient_steps += 1
                     train_step += world_size
-
         # Log metrics
         if cfg.metric.log_level > 0 and (policy_step - last_log >= cfg.metric.log_every or iter_num == total_iters):
             # Sync distributed metrics
@@ -715,23 +747,39 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
             if not timer.disabled:
                 timer_metrics = timer.compute()
                 if "Time/train_time" in timer_metrics and timer_metrics["Time/train_time"] > 0:
+                    whole_training_time += timer_metrics["Time/train_time"]
                     fabric.log(
                         "Time/sps_train",
                         (train_step - last_train) / timer_metrics["Time/train_time"],
                         policy_step,
                     )
+                    fabric.log(
+                        "Time/real_train",
+                        timer_metrics["Time/train_time"],
+                        policy_step,
+                    )
                 if "Time/env_interaction_time" in timer_metrics and timer_metrics["Time/env_interaction_time"] > 0:
+                    whole_interaction_time += timer_metrics["Time/env_interaction_time"]
                     fabric.log(
                         "Time/sps_env_interaction",
                         ((policy_step - last_log) / world_size * cfg.env.action_repeat)
                         / timer_metrics["Time/env_interaction_time"],
                         policy_step,
                     )
+                    fabric.log(
+                        "Time/real_env_interaction",
+                        timer_metrics["Time/env_interaction_time"],
+                        policy_step,
+                    )
                 timer.reset()
 
+                time_string = f'curr_step: {policy_step}, whole_time: {round(time.time() - whole_time, 3)} sec = interaction_time: {round(whole_interaction_time, 3)} + training_time: {round(whole_training_time, 3)}'
+                fabric.print(time_string)
+                
             # Reset counters
             last_log = policy_step
             last_train = train_step
+
 
         # Checkpoint Model
         if (cfg.checkpoint.every > 0 and policy_step - last_checkpoint >= cfg.checkpoint.every) or (

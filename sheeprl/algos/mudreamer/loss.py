@@ -11,6 +11,12 @@ def reconstruction_loss(
     observations: Tensor,
     pr: Distribution,
     rewards: Tensor,
+    pv: Distribution,
+    lambda_values: Tensor,
+    predicted_target_values: Distribution,
+    discount: Tensor,
+    pa: Distribution,
+    actions: Tensor,
     priors_logits: Tensor,
     posteriors_logits: Tensor,
     kl_dynamic: float = 0.5,
@@ -58,8 +64,19 @@ def reconstruction_loss(
         reconstruction_loss (Tensor): the value of the overall reconstruction loss.
     """
     rewards.device
+
+
     observation_loss = -sum([po[k].log_prob(observations[k]) for k in po.keys()])
     reward_loss = -pr.log_prob(rewards)
+    
+    # Compute the distribution over the values
+    value_loss = -pv.log_prob(lambda_values.detach())
+    value_loss = value_loss - pv.log_prob(predicted_target_values.detach())
+    value_loss = torch.mean(value_loss * discount[:-1].squeeze(-1))
+
+    # TODO
+    action_loss = -pa.log_prob(actions)
+    
     # KL balancing
     dyn_loss = kl = kl_divergence(
         Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits.detach()), 1),
@@ -77,7 +94,7 @@ def reconstruction_loss(
         continue_loss = continue_scale_factor * -pc.log_prob(continue_targets)
     else:
         continue_loss = torch.zeros_like(reward_loss)
-    reconstruction_loss = (kl_regularizer * kl_loss + observation_loss + reward_loss + continue_loss).mean()
+    reconstruction_loss = (kl_regularizer * kl_loss + observation_loss + reward_loss + value_loss + action_loss + continue_loss).mean()
     return (
         reconstruction_loss,
         kl.mean(),

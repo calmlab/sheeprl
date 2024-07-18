@@ -21,9 +21,8 @@ from torch.distributions import (
 )
 from torch.distributions.utils import probs_to_logits
 
-from sheeprl.algos.dreamer_v2.agent import WorldModel
 from sheeprl.algos.dreamer_v2.utils import compute_stochastic_state
-from sheeprl.algos.dreamer_v3.utils import init_weights, uniform_init_weights
+from sheeprl.algos.mudreamer.utils import init_weights, uniform_init_weights
 from sheeprl.models.models import (
     CNN,
     MLP,
@@ -593,6 +592,41 @@ class DecoupledRSSM(RSSM):
         return logits, compute_stochastic_state(logits, discrete=self.discrete)
 
 
+class WorldModel(nn.Module):
+    """
+    Wrapper class for the World model.
+
+    Args:
+        encoder (_FabricModule): the encoder.
+        rssm (RSSM): the rssm.
+        observation_model (_FabricModule): the observation model.
+        reward_model (_FabricModule): the reward model.
+        value_model (_FabricModule): the value model.
+        action_model (_FabricModule): the action model.
+        continue_model (_FabricModule, optional): the continue model.
+    """
+
+    def __init__(
+        self,
+        encoder: _FabricModule,
+        rssm: RSSM,
+        observation_model: _FabricModule,
+        reward_model: _FabricModule,
+        value_model: _FabricModule,
+        action_model: _FabricModule,
+        continue_model: Optional[_FabricModule],
+    ) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.rssm = rssm
+        self.observation_model = observation_model
+        self.reward_model = reward_model
+        # value model 추가
+        self.value_model = value_model
+        # action model 추가
+        self.action_model = action_model
+        self.continue_model = continue_model
+
 class PlayerDV3(nn.Module):
     """
     The model of the Dreamer_v3 player.
@@ -1110,6 +1144,42 @@ def build_agent(
             "normalized_shape": world_model_cfg.reward_model.dense_units,
         },
     )
+    
+    # 이건 똑같음
+    value_ln_cls = hydra.utils.get_class(world_model_cfg.value_model.layer_norm.cls)
+    value_model = MLP(
+        input_dims=latent_state_size,
+        output_dim=world_model_cfg.value_model.bins,
+        hidden_sizes=[world_model_cfg.value_model.dense_units] * world_model_cfg.value_model.mlp_layers,
+        activation=hydra.utils.get_class(world_model_cfg.value_model.dense_act),
+        layer_args={"bias": value_ln_cls == nn.Identity},
+        flatten_dim=None,
+        norm_layer=value_ln_cls,
+        norm_args={
+            **world_model_cfg.value_model.layer_norm.kw,
+            "normalized_shape": world_model_cfg.value_model.dense_units,
+        },
+    )
+
+
+    # TODO: action model output과 input맞추기
+    # It shares the same architecture as the actor network but takes the current encoded features 𝑥_𝑡.
+    action_ln_cls = hydra.utils.get_class(cfg.algo.actor.cls)
+    action_model: Actor | MinedojoActor = action_ln_cls(
+        latent_state_size=latent_state_size,
+        actions_dim=actions_dim,
+        is_continuous=is_continuous,
+        init_std=actor_cfg.init_std,
+        min_std=actor_cfg.min_std,
+        dense_units=actor_cfg.dense_units,
+        activation=hydra.utils.get_class(actor_cfg.dense_act),
+        mlp_layers=actor_cfg.mlp_layers,
+        distribution_cfg=cfg.distribution,
+        layer_norm_cls=hydra.utils.get_class(actor_cfg.layer_norm.cls),
+        layer_norm_kw=actor_cfg.layer_norm.kw,
+        unimix=cfg.algo.unimix,
+        action_clip=actor_cfg.action_clip,
+    )
 
     discount_ln_cls = hydra.utils.get_class(world_model_cfg.discount_model.layer_norm.cls)
     continue_model = MLP(
@@ -1130,6 +1200,8 @@ def build_agent(
         rssm,
         observation_model.apply(init_weights),
         reward_model.apply(init_weights),
+        value_model.apply(init_weights),
+        action_model.apply(init_weights),
         continue_model.apply(init_weights),
     )
 
