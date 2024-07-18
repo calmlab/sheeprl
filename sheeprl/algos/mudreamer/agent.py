@@ -727,9 +727,10 @@ class PlayerDV3(nn.Module):
 
 class ActionPredictor(nn.Module):
     """
-    The wrapper class of the Dreamer_v2 Actor model.
+    The wrapper class of the Mudreamer action predictor model.
 
     Args:
+        encoded_feature_size (int): the dimension of the encoder.
         latent_state_size (int): the dimension of the latent state (stochastic size + recurrent_state_size).
         actions_dim (Sequence[int]): the dimension in output of the actor.
             The number of actions if continuous, the dimension of the action if discrete.
@@ -762,6 +763,7 @@ class ActionPredictor(nn.Module):
 
     def __init__(
         self,
+        encoded_feature_size: int,
         latent_state_size: int,
         actions_dim: Sequence[int],
         is_continuous: bool,
@@ -778,6 +780,7 @@ class ActionPredictor(nn.Module):
         action_clip: float = 1.0,
     ) -> None:
         super().__init__()
+        self.input_size = encoded_feature_size + latent_state_size
         self.distribution_cfg = distribution_cfg
         self.distribution = distribution_cfg.get("type", "auto").lower()
         if self.distribution not in ("auto", "normal", "tanh_normal", "discrete", "scaled_normal"):
@@ -793,7 +796,7 @@ class ActionPredictor(nn.Module):
             else:
                 self.distribution = "discrete"
         self.model = MLP(
-            input_dims=latent_state_size,
+            input_dims= self.input_size,
             output_dim=None,
             hidden_sizes=[dense_units] * mlp_layers,
             activation=activation,
@@ -815,14 +818,15 @@ class ActionPredictor(nn.Module):
         self._action_clip = action_clip
 
     def forward(
-        self, state: Tensor, greedy: bool = False, mask: Optional[Dict[str, Tensor]] = None
+        self, previous_state: Tensor, embedded_obs: Tensor, greedy: bool = False, mask: Optional[Dict[str, Tensor]] = None
     ) -> Tuple[Sequence[Tensor], Sequence[Distribution]]:
         """
         Call the forward method of the actor model and reorganizes the result with shape (batch_size, *, num_actions),
         where * means any number of dimensions including None.
 
         Args:
-            state (Tensor): the current state of shape (batch_size, *, stochastic_size + recurrent_state_size).
+            previous_state (Tensor): the previous state of shape (batch_size, *, stochastic_size + recurrent_state_size).
+            embedded_obs (Tensor): the current observation of shape ().
             greedy (bool): whether or not to sample the actions.
                 Default to False.
             mask (Dict[str, Tensor], optional): the mask to use on the actions.
@@ -832,7 +836,8 @@ class ActionPredictor(nn.Module):
             The tensor of the actions taken by the agent with shape (batch_size, *, num_actions).
             The distribution of the actions
         """
-        out: Tensor = self.model(state)
+        combined_input = torch.cat([previous_state, embedded_obs], dim=-1)
+        out: Tensor = self.model(combined_input)
         pre_dist: List[Tensor] = [head(out) for head in self.mlp_heads]
         if self.is_continuous:
             mean, std = torch.chunk(pre_dist[0], 2, -1)
