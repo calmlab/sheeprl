@@ -29,13 +29,18 @@ def reconstruction_loss(
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """
     Compute the reconstruction loss as described in Eq. 5 in
-    [https://arxiv.org/abs/2301.04104](https://arxiv.org/abs/2301.04104).
 
     Args:
         po (Dict[str, Distribution]): the distribution returned by the observation_model (decoder).
         observations (Tensor): the observations provided by the environment.
         pr (Distribution): the reward distribution returned by the reward_model.
         rewards (Tensor): the rewards obtained by the agent during the "Environment interaction" phase.
+        pv (Distribution): the value distribution returned by the value_model.
+        lambda_values (Tensor): Estimated lambda-values
+        predicted_target_values (Distribution): slow moving target critic (실제 critic model에서 사용하는 target critic) TODO: value predictor를 위한 별개의 target critic이 있어야 하는건지?
+        discount (Tensor): discount factor
+        pa (Distribution): the action distribution returned by the action_model.
+        actions (Tensor): The actual actions taken by the agent during the "Environment interaction" phase.
         priors_logits (Tensor): the logits of the prior.
         posteriors_logits (Tensor): the logits of the posterior.
         kl_dynamic (float): the kl-balancing dynamic loss regularizer.
