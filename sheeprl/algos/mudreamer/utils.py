@@ -24,6 +24,8 @@ AGGREGATOR_KEYS = {
     "Loss/value_loss",
     "Loss/policy_loss",
     "Loss/observation_loss",
+    "Loss/value_pred_loss",
+    "Loss/action_pred_loss",
     "Loss/reward_loss",
     "Loss/state_loss",
     "Loss/continue_loss",

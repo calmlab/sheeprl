@@ -107,4 +107,6 @@ def reconstruction_loss(
         reward_loss.mean(),
         observation_loss.mean(),
         continue_loss.mean(),
+        value_loss.mean(),
+        action_loss.mean(),
     )
