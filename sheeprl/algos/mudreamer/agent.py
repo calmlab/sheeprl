@@ -627,9 +627,9 @@ class WorldModel(nn.Module):
         self.action_model = action_model
         self.continue_model = continue_model
 
-class PlayerDV3(nn.Module):
+class PlayerMu(nn.Module):
     """
-    The model of the Dreamer_v3 player.
+    The model of the Mudreamer player.
 
     Args:
         encoder (MultiEncoder): the encoder.
@@ -1421,7 +1421,7 @@ def build_agent(
 
     # Create the player agent
     fabric_player = get_single_device_fabric(fabric)
-    player = PlayerDV3(
+    player = PlayerMu(
         copy.deepcopy(world_model.encoder),
         copy.deepcopy(world_model.rssm),
         copy.deepcopy(actor),
@@ -1455,8 +1455,6 @@ def build_agent(
 
     # Setup the player agent with a single-device Fabric
     player.encoder = fabric_player.setup_module(player.encoder)
-    player.rssm.value_model = fabric.setup_module(world_model.value_model)
-    player.rssm.action_model = fabric.setup_module(world_model.action_model)
     player.rssm.recurrent_model = fabric_player.setup_module(player.rssm.recurrent_model)
     player.rssm.transition_model = fabric_player.setup_module(player.rssm.transition_model)
     player.rssm.representation_model = fabric_player.setup_module(player.rssm.representation_model)

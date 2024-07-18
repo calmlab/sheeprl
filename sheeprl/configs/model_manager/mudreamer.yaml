@@ -1,0 +1,25 @@
+defaults:
+  - default
+  - _self_
+
+models: 
+  world_model:
+    model_name: "${exp_name}_world_model"
+    description: "Mudreamer World Model used in ${env.id} Environment"
+    tags: {}
+  actor:
+    model_name: "${exp_name}_actor"
+    description: "Mudreamer Actor used in ${env.id} Environment"
+    tags: {}
+  critic:
+    model_name: "${exp_name}_critic"
+    description: "Mudreamer Critic used in ${env.id} Environment"
+    tags: {}
+  target_critic:
+    model_name: "${exp_name}_target_critic"
+    description: "Mudreamer Target Critic used in ${env.id} Environment"
+    tags: {}
+  moments:
+    model_name: "${exp_name}_moments"
+    description: "Mudreamer Moments used in ${env.id} Environment"
+    tags: {}

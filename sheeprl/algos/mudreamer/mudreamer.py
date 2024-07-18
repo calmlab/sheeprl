@@ -167,11 +167,9 @@ def train(
     # Compute the distribution over the action
     prev_latent_states = latent_states[:-1]
     encoded_obs = embedded_obs[1:]  # t 시점의 observation
-    if is_continuous:
-        pa = Independent(Normal(world_model.action_model(prev_latent_states, encoded_obs)), 1)
-    else:
-        pa = OneHotCategorical(logits=world_model.action_model(prev_latent_states, encoded_obs))
 
+    # action model 내부에서 return으로 분포를 만들어줌
+    action_logits, pa = world_model.action_model(prev_latent_states, encoded_obs)
     # Compute the distribution over the terminal steps, if required
     pc = Independent(BernoulliSafeMode(logits=world_model.continue_model(latent_states)), 1)
     continues_targets = 1 - data["terminated"]
@@ -181,8 +179,8 @@ def train(
     pv = TwoHotEncodingDistribution(world_model.value_model(latent_states), dims=1)
     # Estimate lambda-values
     lambda_values = compute_lambda_values(
-        pr[1:],
-        pv[1:],
+        pr.mean[1:],
+        pv.mean[1:],
         continues[1:] * cfg.algo.gamma,
         lmbda=cfg.algo.lmbda,
     )
