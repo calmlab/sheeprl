@@ -207,7 +207,7 @@ def train(
         lambda_values,
         predicted_target_values,
         discount,
-        pa,
+        action_logits[0],
         batch_actions, # 
         priors_logits,
         posteriors_logits,

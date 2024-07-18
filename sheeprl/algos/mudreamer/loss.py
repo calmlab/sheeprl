@@ -1,6 +1,7 @@
 from typing import Dict, Optional, Tuple
 
 import torch
+import torch.nn as nn
 from torch import Tensor
 from torch.distributions import Distribution, Independent, OneHotCategoricalStraightThrough
 from torch.distributions.kl import kl_divergence
@@ -15,7 +16,7 @@ def reconstruction_loss(
     lambda_values: Tensor,
     predicted_target_values: Distribution,
     discount: Tensor,
-    pa: Distribution,
+    pa: Tensor,
     actions: Tensor,
     priors_logits: Tensor,
     posteriors_logits: Tensor,
@@ -70,7 +71,6 @@ def reconstruction_loss(
     """
     rewards.device
 
-
     observation_loss = -sum([po[k].log_prob(observations[k]) for k in po.keys()])
     reward_loss = -pr.log_prob(rewards)
     
@@ -80,8 +80,9 @@ def reconstruction_loss(
     value_loss = value_loss * discount.squeeze(-1)
 
     # TODO
-    action_loss = -pa.log_prob(actions)
-    
+    action_loss_fn = nn.CrossEntropyLoss()
+    action_loss = action_loss_fn(pa, actions)
+
     # KL balancing
     dyn_loss = kl = kl_divergence(
         Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits.detach()), 1),
