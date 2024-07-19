@@ -176,7 +176,7 @@ def train(
     pv = TwoHotEncodingDistribution(world_model.value_model(latent_states[:-1].detach()), dims=1)
     # Estimate lambda-values
     lambda_values = compute_lambda_values(
-        pr.mean,
+        data["rewards"][:-1].mean(),
         pv.mean,
         pc.mode * cfg.algo.gamma,
         lmbda=cfg.algo.lmbda,
