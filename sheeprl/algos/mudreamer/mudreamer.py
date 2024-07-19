@@ -128,16 +128,15 @@ def train(
             recurrent_states[i] = recurrent_state
             priors_logits[i] = prior_logits
     else:
-
         posterior = torch.zeros(1, batch_size, stochastic_size, discrete_size, device=device)
-        posteriors = torch.empty(sequence_length, batch_size, stochastic_size, discrete_size, device=device)
+        posteriors = torch.empty(sequence_length, batch_size, stochastic_size, discrete_size, device=device) 
         posteriors_logits = torch.empty(sequence_length, batch_size, stoch_state_size, device=device)
         for i in range(0, sequence_length):
             recurrent_state, posterior, _, posterior_logits, prior_logits = world_model.rssm.dynamic(
-                posterior,
-                recurrent_state,
-                batch_actions[i : i + 1],
-                embedded_obs[i : i + 1],
+                posterior,                      # s_t
+                recurrent_state,                # h_t
+                batch_actions[i : i + 1],       # a_t
+                embedded_obs[i : i + 1],        # x_t
                 data["is_first"][i : i + 1],
             )
             recurrent_states[i] = recurrent_state
@@ -147,7 +146,7 @@ def train(
     latent_states = torch.cat((posteriors.view(*posteriors.shape[:-2], -1), recurrent_states), -1)
 
     # Compute predictions for the observations
-    reconstructed_obs: Dict[str, torch.Tensor] = world_model.observation_model(latent_states)
+    reconstructed_obs: Dict[str, torch.Tensor] = world_model.observation_model(latent_states[:-1])
 
     # Compute the distribution over the reconstructed observations
     po = {
@@ -162,23 +161,19 @@ def train(
     )
 
     # Compute the distribution over the rewards
-    pr = TwoHotEncodingDistribution(world_model.reward_model(latent_states), dims=1)
+    pr = TwoHotEncodingDistribution(world_model.reward_model(latent_states[:-1]), dims=1)
 
     # Compute the distribution over the action
 
     # action model 내부에서 return으로 분포를 만들어줌
-    action_logits, _ = world_model.action_model(latent_states, embedded_obs)
-    if is_continuous:
-        pa = Independent(Normal(action_logits[0]), 1)
-    else:
-        pa = OneHotCategorical(action_logits[0])
+    action_logits, _ = world_model.action_model(latent_states[:-1], embedded_obs[1:])
 
     # Compute the distribution over the terminal steps, if required
-    pc = Independent(BernoulliSafeMode(logits=world_model.continue_model(latent_states)), 1)
+    pc = Independent(BernoulliSafeMode(logits=world_model.continue_model(latent_states[:-1])), 1)
     continues_targets = 1 - data["terminated"]
 
     # Compute the distribution over the values
-    pv = TwoHotEncodingDistribution(world_model.value_model(latent_states.detach()), dims=1)
+    pv = TwoHotEncodingDistribution(world_model.value_model(latent_states[:-1].detach()), dims=1)
     # Estimate lambda-values
     lambda_values = compute_lambda_values(
         pr.mean,
@@ -187,14 +182,18 @@ def train(
         lmbda=cfg.algo.lmbda,
     )
     predicted_target_values = TwoHotEncodingDistribution(
-        target_critic(latent_states.detach()), dims=1
+        target_critic(latent_states[:-1].detach()), dims=1
     ).mean
     with torch.no_grad():
         discount = torch.cumprod(pc.mode * cfg.algo.gamma, dim=0) / cfg.algo.gamma
     
     # Reshape posterior and prior logits to shape [B, T, 32, 32]
-    priors_logits = priors_logits.view(*priors_logits.shape[:-1], stochastic_size, discrete_size)
-    posteriors_logits = posteriors_logits.view(*posteriors_logits.shape[:-1], stochastic_size, discrete_size)
+    priors_logits = priors_logits.view(*priors_logits.shape[:-1], stochastic_size, discrete_size)[:-1]
+    posteriors_logits = posteriors_logits.view(*posteriors_logits.shape[:-1], stochastic_size, discrete_size)[:-1]
+
+    # actor_model shape을 맞춰주기 위해서 꼬리 하나씩 자르기 
+    for k,v in batch_obs.items():
+        batch_obs[k] = v[:-1]
 
     # World model optimization step. Eq. 4 in the paper
     world_optimizer.zero_grad(set_to_none=True)
@@ -202,13 +201,13 @@ def train(
         po,
         batch_obs,
         pr,
-        data["rewards"],
+        data["rewards"][:-1],
         pv,
         lambda_values,
         predicted_target_values,
         discount,
         action_logits[0],
-        batch_actions, # 
+        batch_actions[:-1], # 
         priors_logits,
         posteriors_logits,
         cfg.algo.world_model.kl_dynamic,
@@ -216,7 +215,7 @@ def train(
         cfg.algo.world_model.kl_free_nats,
         cfg.algo.world_model.kl_regularizer,
         pc,
-        continues_targets,
+        continues_targets[:-1],
         cfg.algo.world_model.continue_scale_factor,
     )
     fabric.backward(rec_loss)
