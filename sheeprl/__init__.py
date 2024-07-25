@@ -40,6 +40,7 @@ from sheeprl.algos.dreamer_v1 import evaluate as dreamer_v1_evaluate  # noqa: F4
 from sheeprl.algos.dreamer_v2 import evaluate as dreamer_v2_evaluate  # noqa: F401, isort:skip
 from sheeprl.algos.dreamer_v3 import evaluate as dreamer_v3_evaluate  # noqa: F401, isort:skip
 from sheeprl.algos.droq import evaluate as droq_evaluate  # noqa: F401, isort:skip
+from sheeprl.algos.mudreamer import evaluate as mudreamer_evaluate  # noqa: F401
 from sheeprl.algos.mudreamer_stochastic import evaluate as mudreamer_evaluate  # noqa: F401
 from sheeprl.algos.p2e_dv1 import evaluate as p2e_dv1_evaluate  # noqa: F401, isort:skip
 from sheeprl.algos.p2e_dv2 import evaluate as p2e_dv2_evaluate  # noqa: F401, isort:skip

@@ -576,6 +576,7 @@ class DecoupledRSSM(RSSM):
         posterior = (1 - is_first) * posterior + is_first * initial_posterior.view_as(posterior)
 
         recurrent_state = self.recurrent_model(torch.cat((posterior, action), -1), recurrent_state)
+        recurrent_state = self._uniform_mix(recurrent_state)
         prior_logits, prior = self._transition(recurrent_state)
         return recurrent_state, prior, prior_logits
 
@@ -883,6 +884,105 @@ class ActionPredictor(nn.Module):
             probs = (1 - self._unimix) * probs + self._unimix * uniform
             logits = probs_to_logits(probs)
         return logits
+
+
+class PlayerDV3(nn.Module):
+    """
+    The model of the Dreamer_v3 player.
+
+    Args:
+        encoder (MultiEncoder): the encoder.
+        rssm (RSSM | DecoupledRSSM): the RSSM model.
+        actor (_FabricModule): the actor.
+        actions_dim (Sequence[int]): the dimension of the actions.
+        num_envs (int): the number of environments.
+        stochastic_size (int): the size of the stochastic state.
+        recurrent_state_size (int): the size of the recurrent state.
+        transition_model (_FabricModule): the transition model.
+        discrete_size (int): the dimension of a single Categorical variable in the
+            stochastic state (prior or posterior).
+            Defaults to 32.
+        actor_type (str, optional): which actor the player is using ('task' or 'exploration').
+            Default to None.
+        decoupled_rssm (bool, optional): whether to use the DecoupledRSSM model.
+    """
+
+    def __init__(
+        self,
+        encoder: MultiEncoder | _FabricModule,
+        rssm: RSSM | DecoupledRSSM,
+        actor: Actor | MinedojoActor | _FabricModule,
+        actions_dim: Sequence[int],
+        num_envs: int,
+        stochastic_size: int,
+        recurrent_state_size: int,
+        device: str | torch.device,
+        discrete_size: int = 32,
+        actor_type: str | None = None,
+    ) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.rssm = rssm
+        self.actor = actor
+        self.actions_dim = actions_dim
+        self.num_envs = num_envs
+        self.stochastic_size = stochastic_size
+        self.recurrent_state_size = recurrent_state_size
+        self.device = device
+        self.discrete_size = discrete_size
+        self.actor_type = actor_type
+        self.decoupled_rssm = isinstance(rssm, DecoupledRSSM)
+
+    @torch.no_grad()
+    def init_states(self, reset_envs: Optional[Sequence[int]] = None) -> None:
+        """Initialize the states and the actions for the ended environments.
+
+        Args:
+            reset_envs (Optional[Sequence[int]], optional): which environments' states to reset.
+                If None, then all environments' states are reset.
+                Defaults to None.
+        """
+        if reset_envs is None or len(reset_envs) == 0:
+            self.actions = torch.zeros(1, self.num_envs, np.sum(self.actions_dim), device=self.device)
+            self.recurrent_state, stochastic_state = self.rssm.get_initial_states((1, self.num_envs))
+            self.stochastic_state = stochastic_state.reshape(1, self.num_envs, -1)
+        else:
+            self.actions[:, reset_envs] = torch.zeros_like(self.actions[:, reset_envs])
+            self.recurrent_state[:, reset_envs], stochastic_state = self.rssm.get_initial_states((1, len(reset_envs)))
+            self.stochastic_state[:, reset_envs] = stochastic_state.reshape(1, len(reset_envs), -1)
+
+    def get_actions(
+        self,
+        obs: Dict[str, Tensor],
+        greedy: bool = False,
+        mask: Optional[Dict[str, Tensor]] = None,
+    ) -> Sequence[Tensor]:
+        """
+        Return the greedy actions.
+
+        Args:
+            obs (Dict[str, Tensor]): the current observations.
+            greedy (bool): whether or not to sample the actions.
+                Default to False.
+
+        Returns:
+            The actions the agent has to perform.
+        """
+        embedded_obs = self.encoder(obs)
+        self.recurrent_state = self.rssm.recurrent_model(
+            torch.cat((self.stochastic_state, self.actions), -1), self.recurrent_state
+        )
+        if self.decoupled_rssm:
+            _, self.stochastic_state = self.rssm._representation(embedded_obs)
+        else:
+            _, self.stochastic_state = self.rssm._representation(self.recurrent_state, embedded_obs)
+        self.stochastic_state = self.stochastic_state.view(
+            *self.stochastic_state.shape[:-2], self.stochastic_size * self.discrete_size
+        )
+        actions, _ = self.actor(torch.cat((self.stochastic_state, self.recurrent_state), -1), greedy, mask)
+        self.actions = torch.cat(actions, -1)
+        return actions
+
 
 class Actor(nn.Module):
     """
@@ -1273,6 +1373,7 @@ def build_agent(
         if cfg.algo.cnn_keys.decoder is not None and len(cfg.algo.cnn_keys.decoder) > 0
         else None
     )
+    print(cnn_decoder)
     mlp_decoder = (
         MLPDecoder(
             keys=cfg.algo.mlp_keys.decoder,

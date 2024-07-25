@@ -1,4 +1,4 @@
-"""Mudreamer implementation from [https://arxiv.org/html/2405.15083v1](https://arxiv.org/html/2405.15083v1)
+"""Mudreamer_stochastic implementation from [https://arxiv.org/html/2405.15083v1](https://arxiv.org/html/2405.15083v1)
 """
 
 from __future__ import annotations
@@ -22,9 +22,9 @@ from torch.distributions import Distribution, Independent, OneHotCategorical, No
 from torch.optim import Optimizer
 from torchmetrics import SumMetric
 
-from sheeprl.algos.mudreamer.agent import WorldModel, build_agent
-from sheeprl.algos.mudreamer.loss import reconstruction_loss
-from sheeprl.algos.mudreamer.utils import Moments, compute_lambda_values, prepare_obs, test
+from sheeprl.algos.mudreamer_stochastic.agent import WorldModel, build_agent
+from sheeprl.algos.mudreamer_stochastic.loss import reconstruction_loss
+from sheeprl.algos.mudreamer_stochastic.utils import Moments, compute_lambda_values, prepare_obs, test
 from sheeprl.data.buffers import EnvIndependentReplayBuffer, SequentialReplayBuffer
 from sheeprl.envs.wrappers import RestartOnException
 from sheeprl.utils.distribution import (
