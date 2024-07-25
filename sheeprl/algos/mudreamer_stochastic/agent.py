@@ -22,7 +22,7 @@ from torch.distributions import (
 from torch.distributions.utils import probs_to_logits
 
 from sheeprl.algos.dreamer_v2.utils import compute_stochastic_state
-from sheeprl.algos.mudreamer.utils import init_weights, uniform_init_weights
+from sheeprl.algos.mudreamer_stochastic.utils import init_weights, uniform_init_weights
 from sheeprl.models.models import (
     CNN,
     MLP,
