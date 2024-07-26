@@ -494,6 +494,7 @@ class RSSM(nn.Module):
             The recurrent state (Tensor).
         """
         recurrent_state = self.recurrent_model(torch.cat((prior, actions), -1), recurrent_state)
+        logits = self._uniform_mix(logits)
         _, imagined_prior = self._transition(recurrent_state)
         return imagined_prior, recurrent_state
 
@@ -1373,7 +1374,6 @@ def build_agent(
         if cfg.algo.cnn_keys.decoder is not None and len(cfg.algo.cnn_keys.decoder) > 0
         else None
     )
-    print(cnn_decoder)
     mlp_decoder = (
         MLPDecoder(
             keys=cfg.algo.mlp_keys.decoder,
