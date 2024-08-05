@@ -10,6 +10,23 @@ unity 환경을 env로 wrapping하기 위한 라이브러리인 mlagent-envs는 
 pip install -r requirements.txt
 ```
 
+설치 이후에 `/site-packages/mlagents_envs/envs/unity_gym_env.py` 파일의 import를 수정해주어야 합니다. 
+    * `requirements.txt`에서 설치한 `mlagents-envs`과 `sheeprl`에서 사용하는 `gym`을 같은 `gym`을 import 하도록 맞춰주는 작업입니다.
+
+```python
+import itertools
+
+import numpy as np
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import gymnasium as gym # <---- 이곳
+from gymnasium import error, spaces # <----- 이곳
+
+from mlagents_envs.base_env import ActionTuple, BaseEnv
+from mlagents_envs.base_env import DecisionSteps, TerminalSteps
+from mlagents_envs import logging_util
+```
+
 ### 2. 빌드된 unity 환경 세팅하기.
 
 빌드된 unity 환경은 `sheeprl/unity_env`에 zip파일로 압축되어 있습니다. 
