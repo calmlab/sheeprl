@@ -10,9 +10,47 @@ unity 환경을 env로 wrapping하기 위한 라이브러리인 mlagent-envs는 
 pip install -r requirements.txt
 ```
 
-### 2. unity환경으로 학습시키기.
+### 2. 빌드된 unity 환경 세팅하기.
 
-학습 및 eval을 실행시키는 sh파일을 모아놓은 scripts에 unity환경에서 트레이닝 할수 있는 샘플코드가 마련되어 있습니다.
+빌드된 unity 환경은 `sheeprl/unity_env`에 zip파일로 압축되어 있습니다. 
+
+압축을 푼 폴더에 `---.x86_64`의 파일경로를 실행파일 script의 옵션으로 지정해주어야 합니다. 
+
+`scripts/mudreamer_unity_env.sh`에 다음과 같이 지정하면 됩니다. 
+
+
+```sh
+#!/bin/bash
+
+# 현재 스크립트의 파일 이름을 가져옵니다 (확장자 제외)
+SCRIPT_NAME=$(basename "$0" .sh)
+
+# nohup 명령을 실행하고 백그라운드로 보냅니다
+nohup python -u ../sheeprl.py exp=mudreamer \
+                     env=unity_env \
+                     env.num_envs=4 \
+                     fabric.accelerator=cuda \
+                     algo.total_steps=100000 \
+                     algo.per_rank_batch_size=16 \
+                     checkpoint.keep_last=null \
+                     checkpoint.every=512 \
+                     metric.log_every=100 \
+                     buffer.from_numpy=True \
+                     buffer.size=100000 \
+                     env.wrapper.file_name={이곳에 ---.x86_64파일의 경로를 기재하면 됩니다.} \
+                     > "${SCRIPT_NAME}.log" 2>&1 &
+
+# 방금 시작한 백그라운드 프로세스의 PID를 가져옵니다
+PID=$!
+
+# PID를 출력합니다
+echo "프로세스가 시작되었습니다. PID: $PID"
+```
+
+
+### 3. unity환경으로 학습시키기.
+
+이후에 수정된 sh 파일을 실행시키면 됩니다.
 
 ```bash
 cd scripts
