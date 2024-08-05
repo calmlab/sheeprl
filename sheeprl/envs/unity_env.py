@@ -40,6 +40,5 @@ class UnityWrapper(UnityToGymWrapper):
         obs = super().reset()
         if obs.dtype == np.float32:
             obs = (obs * 255).astype(np.uint8)
-        print('-------------- reset complete! ---------------')
         return obs, {}
 
