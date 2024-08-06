@@ -1,0 +1,13 @@
+defaults:
+  - default
+  - _self_
+
+# Override from `default` config
+id: Unity_env
+frame_stack: 1
+sync_env: True
+action_repeat: 1
+# Wrapper to be instantiated
+wrapper:
+  _target_: sheeprl.envs.unity_env.UnityWrapper
+  file_name: /home/calm03/data/project/calmlab_rl_model/header_agent/Sample.x86_64

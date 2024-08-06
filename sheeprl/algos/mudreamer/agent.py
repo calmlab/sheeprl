@@ -341,7 +341,7 @@ class RecurrentModel(nn.Module):
 
 
 class RSSM(nn.Module):
-    """RSSM model for the model-base Dreamer agent.
+    """RSSM model for the model-base Mudreamer agent.
 
     Args:
         recurrent_model (nn.Module): the recurrent model of the RSSM model described in
@@ -429,6 +429,7 @@ class RSSM(nn.Module):
         posterior = (1 - is_first) * posterior + is_first * initial_posterior.view_as(posterior)
 
         recurrent_state = self.recurrent_model(torch.cat((posterior, action), -1), recurrent_state)
+        recurrent_state = self._uniform_mix(recurrent_state)
         prior_logits, prior = self._transition(recurrent_state)
         posterior_logits, posterior = self._representation(recurrent_state, embedded_obs)
         return recurrent_state, posterior, prior, posterior_logits, prior_logits

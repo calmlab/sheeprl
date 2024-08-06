@@ -21,6 +21,7 @@ from sheeprl.algos.dreamer_v2 import dreamer_v2  # noqa: F401
 from sheeprl.algos.dreamer_v3 import dreamer_v3  # noqa: F401
 from sheeprl.algos.droq import droq  # noqa: F401
 from sheeprl.algos.mudreamer import mudreamer  # noqa: F401
+from sheeprl.algos.mudreamer_stochastic import mudreamer_stochastic  # noqa: F401
 from sheeprl.algos.p2e_dv1 import p2e_dv1_exploration  # noqa: F401
 from sheeprl.algos.p2e_dv1 import p2e_dv1_finetuning  # noqa: F401
 from sheeprl.algos.p2e_dv2 import p2e_dv2_exploration  # noqa: F401
@@ -40,6 +41,7 @@ from sheeprl.algos.dreamer_v2 import evaluate as dreamer_v2_evaluate  # noqa: F4
 from sheeprl.algos.dreamer_v3 import evaluate as dreamer_v3_evaluate  # noqa: F401, isort:skip
 from sheeprl.algos.droq import evaluate as droq_evaluate  # noqa: F401, isort:skip
 from sheeprl.algos.mudreamer import evaluate as mudreamer_evaluate  # noqa: F401
+from sheeprl.algos.mudreamer_stochastic import evaluate as mudreamer_evaluate  # noqa: F401
 from sheeprl.algos.p2e_dv1 import evaluate as p2e_dv1_evaluate  # noqa: F401, isort:skip
 from sheeprl.algos.p2e_dv2 import evaluate as p2e_dv2_evaluate  # noqa: F401, isort:skip
 from sheeprl.algos.p2e_dv3 import evaluate as p2e_dv3_evaluate  # noqa: F401, isort:skip
