@@ -69,10 +69,10 @@ def compute_lambda_values(
     continues: Tensor,
     lmbda: float = 0.95,
 ):
-    vals = [values[-1:]]
-    interm = rewards + continues * values * (1 - lmbda)
+    vals = [values[-1:]] #vξ​(z^t+1​)
+    interm = rewards + continues * values * (1 - lmbda) #𝑟^𝑡+𝛾^𝑡(1−𝜆)𝑣𝜉(𝑧^𝑡+1)r^t​+γ^​t​(1−λ)vξ​(z^t+1​)
     for t in reversed(range(len(continues))):
-        vals.append(interm[t] + continues[t] * lmbda * vals[-1])
+        vals.append(interm[t] + continues[t] * lmbda * vals[-1])  # +𝜆𝑉𝑡+1𝜆λVt+1λ​
     ret = torch.cat(list(reversed(vals))[:-1])
     return ret
 

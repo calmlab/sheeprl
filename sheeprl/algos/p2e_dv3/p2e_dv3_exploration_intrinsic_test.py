@@ -37,6 +37,32 @@ from sheeprl.utils.utils import Ratio, save_configs, unwrap_fabric
 # Decomment the following line if you are using MineDojo on an headless machine
 # os.environ["MINEDOJO_HEADLESS"] = "1"
 
+def compute_intrinsic_reward(config, imagined_trajectories, imagined_actions, ensembles):
+    if config.intrinsic_reward == "random_network_distillation":
+        pass
+    elif config.intrinsic_reward == "plan2explore":
+        return compute_plan2explore_intrinsic_reward(imagined_trajectories, imagined_actions, ensembles)
+    else:
+        raise ValueError(f"Unknown intrinsic reward type: {config.intrinsic_reward}")
+
+def compute_plan2explore_intrinsic_reward(cfg,imagined_trajectories, imagined_actions, ensembles):
+    next_state_embedding = torch.empty(
+        len(ensembles),
+        cfg.algo.horizon + 1,
+        cfg.batch_size * cfg.sequence_length,
+        cfg.stochastic_size * cfg.discrete_size,
+        device=cfg.device,
+    )
+    for i, ens in enumerate(ensembles):
+        next_state_embedding[i] = ens(
+            torch.cat((imagined_trajectories.detach(), imagined_actions.detach()), -1)
+        )
+    
+    # Compute intrinsic reward as the variance of ensemble predictions
+    intrinsic_reward = next_state_embedding.var(0).mean(-1, keepdim=True) * cfg.algo.intrinsic_reward_multiplier
+    return intrinsic_reward
+
+
 def train(
     fabric: Fabric,
     world_model: WorldModel,
@@ -140,7 +166,7 @@ def train(
         priors_logits[i] = prior_logits
         posteriors[i] = posterior
         posteriors_logits[i] = posterior_logits
-    latent_states = torch.cat((posteriors.view(*posteriors.shape[:-2], -1), recurrent_states), -1) #이게 왜 이렇게..?
+    latent_states = torch.cat((posteriors.view(*posteriors.shape[:-2], -1), recurrent_states), -1)
     
         # recurrent_state: torch.Size([1, 16, 4096])
         # posteriors: torch.Size([64, 16, 32, 32]) #seq_len, batch_size, stoch, discrete
@@ -216,7 +242,6 @@ def train(
     # Ensemble Learning
     loss = 0.0
     ensemble_optimizer.zero_grad(set_to_none=True)
-    #posterior, action, h_t를 input으로 받아서 다음 상태를 예측하는 것을 훈련, 나중에 이 ensemble model의 variance를 재서 intrinsic reward를 측정하기 위해서
     for ens in ensembles:
         out = ens(
             torch.cat(
@@ -260,12 +285,7 @@ def train(
         data["actions"].shape[-1],
         device=device,
     )
-    #deterministic하면 True, 아니면 False
-    greedy = False #cfg.algo.deterministic_actions
-    
-    actions = torch.cat(actor_exploration(imagined_latent_state.detach(),greedy=greedy)[0], dim=-1)
-        
-    # print("actions:",actions.shape)
+    actions = torch.cat(actor_exploration(imagined_latent_state.detach())[0], dim=-1)
     imagined_actions[0] = actions
 
     # imagine trajectories in the latent space
@@ -275,7 +295,7 @@ def train(
         imagined_prior = imagined_prior.view(1, -1, stoch_state_size)
         imagined_latent_state = torch.cat((imagined_prior, recurrent_state), -1)
         imagined_trajectories[i] = imagined_latent_state
-        actions = torch.cat(actor_exploration(imagined_latent_state.detach(), greedy=greedy)[0], dim=-1)
+        actions = torch.cat(actor_exploration(imagined_latent_state.detach())[0], dim=-1)
         imagined_actions[i] = actions
 
     advantages = []
@@ -288,30 +308,14 @@ def train(
         continues = torch.cat((true_continue, continues[1:])) 
 
         if critic["reward_type"] == "intrinsic":
-            # Predict intrinsic reward
-            next_state_embedding = torch.empty(
-                len(ensembles),
-                cfg.algo.horizon + 1,
-                batch_size * sequence_length,
-                stochastic_size * discrete_size,
-                device=device,
-            )
-            for i, ens in enumerate(ensembles):
-                next_state_embedding[i] = ens(
-                    torch.cat((imagined_trajectories.detach(), imagined_actions.detach()), -1)
-                )
-
-            # next_state_embedding -> N_ensemble x Horizon x Batch_size*Seq_len x Obs_embedding_size
-            # 결과적으로 reward가 여기서 주어지네. 
-            reward = next_state_embedding.var(0).mean(-1, keepdim=True) * cfg.algo.intrinsic_reward_multiplier
+            reward = compute_intrinsic_reward(cfg, imagined_trajectories, imagined_actions, ensembles)
             if aggregator and not aggregator.disabled:
                 aggregator.update(f"Rewards/intrinsic_{k}", reward.detach().cpu().mean())
         else:
             reward = TwoHotEncodingDistribution(world_model.reward_model(imagined_trajectories), dims=1).mean
         
         #critic을 계산하는 산식이 이렇다는 것이고,
-        #이렇게 계산한 advantage를 바탕으로 actor의 policy를 평가하겠다.
-    
+
         lambda_values = compute_lambda_values(
             reward[1:],
             predicted_values[1:],
@@ -334,9 +338,10 @@ def train(
         discount = torch.cumprod(continues * cfg.algo.gamma, dim=0) / cfg.algo.gamma
 
     actor_exploration_optimizer.zero_grad(set_to_none=True)
-
-    #actor_exploration의 policy
+    #....?
     policies: Sequence[Distribution] = actor_exploration(imagined_trajectories.detach())[1]
+    #각 행동확률들에 대한 log_prob을 계산해서, 이걸 하나의 텐서로 sum. #log_probs = [-1.61, -0.69, -1.20] ->  sum(log_probs) = -1.61 + -0.69 + -1.20 = -3.50
+    #이걸 Advantage에 곱해줌.. objective = -3.50 * 2.0 = -7.0 #policy_gradient
     if is_continuous:
         objective = advantage
     else:
@@ -350,7 +355,6 @@ def train(
             ).sum(dim=-1)
             * advantage.detach()
         )
-        
     try:
         entropy = cfg.algo.actor.ent_coef * torch.stack([p.entropy() for p in policies], -1).sum(dim=-1)
     except NotImplementedError:
@@ -415,7 +419,7 @@ def train(
         data["actions"].shape[-1],
         device=device,
     )
-    actions = torch.cat(actor_task(imagined_latent_state.detach(), greedy=greedy)[0], dim=-1)
+    actions = torch.cat(actor_task(imagined_latent_state.detach())[0], dim=-1)
     imagined_actions[0] = actions
 
     # imagine trajectories in the latent space
@@ -424,7 +428,7 @@ def train(
         imagined_prior = imagined_prior.view(1, -1, stoch_state_size)
         imagined_latent_state = torch.cat((imagined_prior, recurrent_state), -1)
         imagined_trajectories[i] = imagined_latent_state
-        actions = torch.cat(actor_task(imagined_latent_state.detach(), greedy=greedy)[0], dim=-1)
+        actions = torch.cat(actor_task(imagined_latent_state.detach())[0], dim=-1)
         imagined_actions[i] = actions
 
     # Predict values, rewards and continues
@@ -444,9 +448,7 @@ def train(
     # Compute the discounts to multiply the lambda values to
     with torch.no_grad():
         discount = torch.cumprod(continues * cfg.algo.gamma, dim=0) / cfg.algo.gamma
-    
-    #actor_task의 업데이트.
-    
+
     actor_task_optimizer.zero_grad(set_to_none=True)
     policies: Sequence[Distribution] = actor_task(imagined_trajectories.detach())[1] #actor task가 imagined_trajectories를 보고 어떤 정책으로 그것을 예측
 
@@ -547,7 +549,8 @@ def train(
     world_optimizer.zero_grad(set_to_none=True)
     ensemble_optimizer.zero_grad(set_to_none=True)
     for c in critics_exploration.values():
-        c["optimizer"].zero_grad(set_to_none=True)            
+        c["optimizer"].zero_grad(set_to_none=True)
+            
 
 
 @register_algorithm()
@@ -942,17 +945,17 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                     device=fabric.device,
                     from_numpy=cfg.buffer.from_numpy,
                 )
-                # import pickle
-                # import json
-                # filename = f"sample_data_iter_{iter_num}.pkl"
-                # sample_data_numpy = {key: value.cpu().numpy() if isinstance(value, torch.Tensor) else value for key, value in local_data.items()}
+                import pickle
+                import json
+                filename = f"sample_data_iter_{iter_num}.pkl"
+                sample_data_numpy = {key: value.cpu().numpy() if isinstance(value, torch.Tensor) else value for key, value in local_data.items()}
 
-                # # 피클 형식으로 저장
-                # with open(filename, 'wb') as f:
-                #     pickle.dump(sample_data_numpy, f)
-                # print(f"Sample data saved to {filename}")    
+                # 피클 형식으로 저장
+                with open(filename, 'wb') as f:
+                    pickle.dump(sample_data_numpy, f)
+                print(f"Sample data saved to {filename}")    
 
-                # print(type(local_data))
+                print(type(local_data))
                 
                 # Start training
                 with timer("Time/train_time", SumMetric, sync_on_compute=cfg.metric.sync_on_compute):

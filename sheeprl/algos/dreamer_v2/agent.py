@@ -363,8 +363,8 @@ class RSSM(nn.Module):
         posterior = (1 - is_first) * posterior.view(*posterior.shape[:-2], -1)
         recurrent_state = (1 - is_first) * recurrent_state
         recurrent_state = self.recurrent_model(torch.cat((posterior, action), -1), recurrent_state)
-        prior_logits, prior = self._transition(recurrent_state)
-        posterior_logits, posterior = self._representation(recurrent_state, embedded_obs)
+        prior_logits, prior = self._transition(recurrent_state) #for dynamic modeling loss
+        posterior_logits, posterior = self._representation(recurrent_state, embedded_obs) #for representation loss
         return recurrent_state, posterior, prior, posterior_logits, prior_logits
 
     def _representation(self, recurrent_state: Tensor, embedded_obs: Tensor) -> Tuple[Tensor, Tensor]:
@@ -901,6 +901,7 @@ def build_agent(
         else None
     )
     encoder = MultiEncoder(cnn_encoder, mlp_encoder)
+    
     recurrent_model = RecurrentModel(
         **world_model_cfg.recurrent_model,
         input_size=int(sum(actions_dim) + stochastic_size),
@@ -968,6 +969,8 @@ def build_agent(
         else None
     )
     observation_model = MultiDecoder(cnn_decoder, mlp_decoder)
+    
+    
     reward_model = MLP(
         input_dims=latent_state_size,
         output_dim=1,

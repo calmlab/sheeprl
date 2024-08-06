@@ -82,7 +82,7 @@ def build_agent(
 
     # Sizes
     stochastic_size = world_model_cfg.stochastic_size * world_model_cfg.discrete_size
-    latent_state_size = stochastic_size + world_model_cfg.recurrent_model.recurrent_state_size
+    latent_state_size = stochastic_size + world_model_cfg.recurrent_model.recurrent_state_size #determinisitc term과 stochastic term의 더하기.
 
     # Create task models
     world_model, actor_task, critic_task, target_critic_task, player = dv3_build_agent(
@@ -114,7 +114,8 @@ def build_agent(
         unimix=cfg.algo.unimix,
     )
 
-    single_device_fabric = get_single_device_fabric(fabric)
+    single_device_fabric = get_single_device_fabric(fabric) #일부 특별한 작업은 한 GPU에서만 수행하여 안정성을 높일떄, 여기서는 critics_exploration, gpu가 4개면 각각 다른 타겟 네트워크가 생길수있으니까.
+    
     critics_exploration = {}
     intrinsic_critics = 0
     critic_ln_cls = hydra.utils.get_class(critic_cfg.layer_norm.cls)
@@ -124,7 +125,7 @@ def build_agent(
                 intrinsic_critics += 1
             critics_exploration[k] = {
                 "weight": v.weight,
-                "reward_type": v.reward_type,
+                "reward_type": v.reward_type, #얘는 external도 섞어쓰니깐.
                 "module": MLP(
                     input_dims=latent_state_size,
                     output_dim=critic_cfg.bins,
@@ -142,11 +143,11 @@ def build_agent(
             critics_exploration[k]["module"].apply(init_weights)
             if cfg.algo.hafner_initialization:
                 critics_exploration[k]["module"].model[-1].apply(uniform_init_weights(0.0))
-            if critics_exploration_state:
-                critics_exploration[k]["module"].load_state_dict(critics_exploration_state[k]["module"])
-            critics_exploration[k]["module"] = fabric.setup_module(critics_exploration[k]["module"])
-            critics_exploration[k]["target_module"] = copy.deepcopy(critics_exploration[k]["module"].module)
-            if critics_exploration_state:
+            if critics_exploration_state: #이전 학습상태가 있다면 호출
+                critics_exploration[k]["module"].load_state_dict(critics_exploration_state[k]["module"]) #가중치 불러와
+            critics_exploration[k]["module"] = fabric.setup_module(critics_exploration[k]["module"]) #단일 gpu에서 돌게해
+            critics_exploration[k]["target_module"] = copy.deepcopy(critics_exploration[k]["module"].module) #critic의 main module을 targe_module에 할당
+            if critics_exploration_state: #critics_exploration_state에 module은 있지만 target_module이 없는 경우, 첫 번째 로딩은 성공하고 두 번째는 건너뛰게 됩니다.
                 critics_exploration[k]["target_module"].load_state_dict(critics_exploration_state[k]["target_module"])
             critics_exploration[k]["target_module"] = single_device_fabric.setup_module(
                 critics_exploration[k]["target_module"]
@@ -166,18 +167,20 @@ def build_agent(
     # Setup exploration models with Fabric
     actor_exploration = fabric.setup_module(actor_exploration)
 
-    # Set requires_grad=False for all target critics
+    # Set requires_grad=False for all target critics #타겟 크리틱들의 그래디언트 계산 비활성화:
     target_critic_task.requires_grad_(False)
     for c in critics_exploration.values():
         c["target_module"].requires_grad_(False)
 
     # initialize the ensembles with different seeds to be sure they have different weights
+    #모델 여러개 띄어놓고 분산계산하는식이니깐.
     ens_list = []
     cfg_ensembles = cfg.algo.ensembles
     ensembles_ln_cls = hydra.utils.get_class(cfg_ensembles.layer_norm.cls)
-    with isolate_rng():
+    with isolate_rng(): #앙상블이니깐 서로 다른 시드로 로드
         for i in range(cfg_ensembles.n):
             fabric.seed_everything(cfg.seed + i)
+            #서로 다른 예측을 하게해서 그걸 mlp layer에 통과. 이때 입력차원이 action_dim +recurrent_state_size(h_t) + (stochasitc/z_t)
             ens_list.append(
                 MLP(
                     input_dims=int(
@@ -185,7 +188,7 @@ def build_agent(
                         + cfg.algo.world_model.recurrent_model.recurrent_state_size
                         + cfg.algo.world_model.stochastic_size * cfg.algo.world_model.discrete_size
                     ),
-                    output_dim=cfg.algo.world_model.stochastic_size * cfg.algo.world_model.discrete_size,
+                    output_dim=cfg.algo.world_model.stochastic_size * cfg.algo.world_model.discrete_size, #next s_t
                     hidden_sizes=[cfg_ensembles.dense_units] * cfg_ensembles.mlp_layers,
                     activation=hydra.utils.get_class(cfg_ensembles.dense_act),
                     flatten_dim=None,

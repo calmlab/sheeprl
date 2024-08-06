@@ -52,6 +52,9 @@ world_model:
   clip_gradients: 1000.0
   decoupled_rssm: False
   learnable_initial_recurrent_state: True
+  #이 2개가 false, false여야, developmental curiosity settting과 같음.
+  sampling : False
+  greedy: False
 
   # Encoder
   encoder:

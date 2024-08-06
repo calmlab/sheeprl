@@ -18,7 +18,7 @@ critics_exploration:
     reward_type: task
 
 ensembles:
-  n: 8 # the number of the ensembles
+  n: 3 # the number of the ensembles
   dense_act: ${algo.dense_act}
   mlp_layers: ${algo.mlp_layers}
   dense_units: ${algo.dense_units}

@@ -371,6 +371,7 @@ class RSSM(nn.Module):
         discrete: int = 32,
         unimix: float = 0.01,
         learnable_initial_recurrent_state: bool = True,
+        sampling: bool = True
     ) -> None:
         super().__init__()
         self.recurrent_model = recurrent_model
@@ -387,10 +388,16 @@ class RSSM(nn.Module):
             self.register_buffer(
                 "initial_recurrent_state", torch.zeros(recurrent_model.recurrent_state_size, dtype=torch.float32)
             )
+        self.sampling = sampling
+                
 
     def get_initial_states(self, batch_shape: Sequence[int] | torch.Size) -> Tuple[Tensor, Tensor]:
         initial_recurrent_state = torch.tanh(self.initial_recurrent_state).expand(*batch_shape, -1)
+        # initial_recurrent_state = torch.zeros(16, 4096)
+        # print("batch_shape:",batch_shape)
+        # print("initial_recurrent_state shape:", initial_recurrent_state.shape)  # 추가된 디버그 출력
         initial_posterior = self._transition(initial_recurrent_state, sample_state=False)[1]
+        # print("initial_posterior shape:", initial_posterior.shape)  # 추가된 디버그 출력
         return initial_recurrent_state, initial_posterior
 
     def dynamic(
@@ -462,7 +469,7 @@ class RSSM(nn.Module):
         """
         logits: Tensor = self.representation_model(torch.cat((recurrent_state, embedded_obs), -1))
         logits = self._uniform_mix(logits)
-        return logits, compute_stochastic_state(logits, discrete=self.discrete)
+        return logits, compute_stochastic_state(logits, discrete=self.discrete, sample=self.sampling)
 
     def _transition(self, recurrent_out: Tensor, sample_state=True) -> Tuple[Tensor, Tensor]:
         """
@@ -477,7 +484,7 @@ class RSSM(nn.Module):
         """
         logits: Tensor = self.transition_model(recurrent_out)
         logits = self._uniform_mix(logits)
-        return logits, compute_stochastic_state(logits, discrete=self.discrete, sample=sample_state)
+        return logits, compute_stochastic_state(logits, discrete=self.discrete, sample=self.sampling)
 
     def imagination(self, prior: Tensor, recurrent_state: Tensor, actions: Tensor) -> Tuple[Tensor, Tensor]:
         """
@@ -798,33 +805,35 @@ class Actor(nn.Module):
             The tensor of the actions taken by the agent with shape (batch_size, *, num_actions).
             The distribution of the actions
         """
-        out: Tensor = self.model(state)
+        out: Tensor = self.model(state) #model에서 
         pre_dist: List[Tensor] = [head(out) for head in self.mlp_heads]
         if self.is_continuous:
             mean, std = torch.chunk(pre_dist[0], 2, -1)
+            #평균값을 -5~5로 제한함.
             if self.distribution == "tanh_normal":
                 mean = 5 * torch.tanh(mean / 5)
-                std = F.softplus(std + self.init_std) + self.min_std
-                actions_dist = Normal(mean, std)
-                actions_dist = Independent(TransformedDistribution(actions_dist, TanhTransform()), 1)
+                std = F.softplus(std + self.init_std) + self.min_std #std는 항상 양수.
+                actions_dist = Normal(mean, std) #정규분포를 하나먼들어서
+                actions_dist = Independent(TransformedDistribution(actions_dist, TanhTransform()), 1) #이 정규분포에 대해서 tanh를 적용해서 -1~1
             elif self.distribution == "normal":
                 actions_dist = Normal(mean, std)
-                actions_dist = Independent(actions_dist, 1)
+                actions_dist = Independent(actions_dist, 1) # 차원이 독립적인 다변량 정규분포로 만들기
             elif self.distribution == "scaled_normal":
-                std = (self.max_std - self.min_std) * torch.sigmoid(std + self.init_std) + self.min_std
+                std = (self.max_std - self.min_std) * torch.sigmoid(std + self.init_std) + self.min_std #표준편차를 min_std와 max_std 사이로 제한
                 dist = Normal(torch.tanh(mean), std)
                 actions_dist = Independent(dist, 1)
-            if not greedy:
+            if not greedy: #무작위로 샘플링
                 actions = actions_dist.rsample()
             else:
-                sample = actions_dist.sample((100,))
-                log_prob = actions_dist.log_prob(sample)
-                actions = sample[log_prob.argmax(0)].view(1, 1, -1)
-            if self._action_clip > 0.0:
-                action_clip = torch.full_like(actions, self._action_clip)
-                actions = actions * (action_clip / torch.maximum(action_clip, torch.abs(actions))).detach()
+                sample = actions_dist.sample((100,)) # 100개의 샘플을 가지고 와서
+                log_prob = actions_dist.log_prob(sample) # 각 샘플들의 로그 확률을 계산.
+                actions = sample[log_prob.argmax(0)].view(1, 1, -1) #가장 높은 확률을 가진 샘플선택 (argmax)
+            if self._action_clip > 0.0: 
+                action_clip = torch.full_like(actions, self._action_clip) #action과 같은 크기의 텐서들을 만들어놓고,
+                actions = actions * (action_clip / torch.maximum(action_clip, torch.abs(actions))).detach() #행동의 절대값을 계산하고, 클립핑 값중에서 큰걸 선택한다음, 그걸 action_clip에 대해서 나누어주면, 뭐가 벗어난 행동이고 아닌지 알꺼니깐.
             actions = [actions]
             actions_dist = [actions_dist]
+            
         else:
             actions_dist: List[Distribution] = []
             actions: List[Tensor] = []
@@ -833,15 +842,15 @@ class Actor(nn.Module):
                 if not greedy:
                     actions.append(actions_dist[-1].rsample())
                 else:
-                    actions.append(actions_dist[-1].mode)
+                    actions.append(actions_dist[-1].mode) #argmax
         return tuple(actions), tuple(actions_dist)
 
     def _uniform_mix(self, logits: Tensor) -> Tensor:
         if self._unimix > 0.0:
-            probs = logits.softmax(dim=-1)
-            uniform = torch.ones_like(probs) / probs.shape[-1]
-            probs = (1 - self._unimix) * probs + self._unimix * uniform
-            logits = probs_to_logits(probs)
+            probs = logits.softmax(dim=-1) #logits값들을 확률로 받아와서 
+            uniform = torch.ones_like(probs) / probs.shape[-1] #모든 행동에 대해서 균일분포를 생성하고,
+            probs = (1 - self._unimix) * probs + self._unimix * uniform #그걸 self._unimix만큼 섞어.
+            logits = probs_to_logits(probs) #섞인 확률 분포를 다시 로짓으로 변환
         return logits
 
 
@@ -1062,6 +1071,7 @@ def build_agent(
         discrete=world_model_cfg.discrete_size,
         unimix=cfg.algo.unimix,
         learnable_initial_recurrent_state=cfg.algo.world_model.learnable_initial_recurrent_state,
+        sampling = world_model_cfg.get('sampling', True)
     ).to(fabric.device)
 
     cnn_decoder = (

@@ -61,10 +61,12 @@ def reconstruction_loss(
     observation_loss = -sum([po[k].log_prob(observations[k]) for k in po.keys()])
     reward_loss = -pr.log_prob(rewards)
     # KL balancing
+    
     dyn_loss = kl = kl_divergence(
         Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits.detach()), 1),
         Independent(OneHotCategoricalStraightThrough(logits=priors_logits), 1),
     )
+    #kL 발산의 하한값으로, 작은 KL 손실 값을 무시할 수 있도록
     free_nats = torch.full_like(dyn_loss, kl_free_nats)
     dyn_loss = kl_dynamic * torch.maximum(dyn_loss, free_nats)
     repr_loss = kl_divergence(
@@ -85,4 +87,79 @@ def reconstruction_loss(
         reward_loss.mean(),
         observation_loss.mean(),
         continue_loss.mean(),
+    )
+
+def reconstruction_loss_test(
+    po: Dict[str, Distribution],
+    observations: Dict[str, Tensor],
+    sensor_data: Dict[str, Tensor],
+    visible_indicators: Dict[str, Tensor],
+    pr: Distribution,
+    rewards: Tensor,
+    priors_logits: Tensor,
+    posteriors_logits: Tensor,
+    kl_dynamic: float = 0.5,
+    kl_representation: float = 0.1,
+    kl_free_nats: float = 1.0,
+    kl_regularizer: float = 1.0,
+    pc: Optional[Distribution] = None,
+    continue_targets: Optional[Tensor] = None,
+    continue_scale_factor: float = 1.0,
+    sensor_loss_weight: float = 1.0,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    
+    # Observation loss
+    observation_loss = sum([
+        (-po[k].log_prob(observations[k]) * visible_indicators[k]).sum()
+        for k in po.keys()
+    ])
+
+    # Sensor loss
+    sensor_loss = sum([
+        ((po[k].mean - sensor_data[k]).pow(2) * visible_indicators[k]).sum()
+        for k in sensor_data.keys()
+    ])
+    
+    # Reward loss
+    reward_loss = -pr.log_prob(rewards)
+
+    # KL balancing
+    dyn_loss = kl = kl_divergence(
+        Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits.detach()), 1),
+        Independent(OneHotCategoricalStraightThrough(logits=priors_logits), 1),
+    )
+    free_nats = torch.full_like(dyn_loss, kl_free_nats)
+    dyn_loss = kl_dynamic * torch.maximum(dyn_loss, free_nats)
+    
+    repr_loss = kl_divergence(
+        Independent(OneHotCategoricalStraightThrough(logits=posteriors_logits), 1),
+        Independent(OneHotCategoricalStraightThrough(logits=priors_logits.detach()), 1),
+    )
+    repr_loss = kl_representation * torch.maximum(repr_loss, free_nats)
+    
+    kl_loss = dyn_loss + repr_loss
+
+    # Continue loss
+    if pc is not None and continue_targets is not None:
+        continue_loss = continue_scale_factor * -pc.log_prob(continue_targets)
+    else:
+        continue_loss = torch.zeros_like(reward_loss)
+
+    # Total reconstruction loss
+    reconstruction_loss = (
+        kl_regularizer * kl_loss + 
+        observation_loss + 
+        sensor_loss_weight * sensor_loss + 
+        reward_loss + 
+        continue_loss
+    ).mean()
+
+    return (
+        reconstruction_loss,
+        kl.mean(),
+        kl_loss.mean(),
+        reward_loss.mean(),
+        observation_loss.mean(),
+        continue_loss.mean(),
+        sensor_loss.mean(),
     )
