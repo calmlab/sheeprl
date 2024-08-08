@@ -91,6 +91,7 @@ def train(
         posteriors[i] = posterior
         posteriors_logits[i] = posterior_logits
     latent_states = torch.cat((posteriors.view(*posteriors.shape[:-2], -1), recurrent_states), -1)
+ 
     reconstructed_obs: Dict[str, torch.Tensor] = world_model.observation_model(latent_states) #torch.Size([64, 16, 3, 64, 64])
 
     # compute the distribution over the reconstructed observations
@@ -202,58 +203,60 @@ def train(
     #deterministic하면 True, 아니면 False
     # greedy = cfg.algo.deterministic_actions
     
-    actions, _, _, _ = ppo_agent(imagined_latent_state.detach()) 
-    print("actions shape:", [a.shape for a in actions]) 
-    print("imagined_actions shape:", imagined_actions.shape)
+    actions, _, _, _ = ppo_agent(latent_states.detach()) 
+    print("actions:",actions.shape)
+    print("latent_states:",latent_states.shape)
         
-    imagined_actions[0] = actions
+    # imagined_actions[0] = actions
 
     # imagine trajectories in the latent space
     #여기서 부터 latent space level에서 시뮬레이션.
-    for i in range(1, cfg.algo.horizon + 1):
-        imagined_prior, recurrent_state = world_model.rssm.imagination(imagined_prior, recurrent_state, actions)
-        imagined_prior = imagined_prior.view(1, -1, stoch_state_size)
-        imagined_latent_state = torch.cat((imagined_prior, recurrent_state), -1)
-        imagined_trajectories[i] = imagined_latent_state
-        actions, _, _, _ = ppo_agent(imagined_latent_state.detach())
-        imagined_actions[i] = actions
+    # for i in range(1, cfg.algo.horizon + 1):
+    #     imagined_prior, recurrent_state = world_model.rssm.imagination(imagined_prior, recurrent_state, actions)
+    #     imagined_prior = imagined_prior.view(1, -1, stoch_state_size)
+    #     imagined_latent_state = torch.cat((imagined_prior, recurrent_state), -1)
+    #     imagined_trajectories[i] = imagined_latent_state
+    #     actions, _, _, _ = ppo_agent(imagined_latent_state.detach())
+    #     imagined_actions[i] = actions
 
 
     next_state_embedding = torch.empty(
         len(ensembles),
-        cfg.algo.horizon + 1,
-        batch_size * sequence_length,
+        sequence_length,
+        batch_size,
         stochastic_size * discrete_size,
         device=device,
     )
+    
     for i, ens in enumerate(ensembles):
         next_state_embedding[i] = ens(
-            torch.cat((imagined_trajectories.detach(), imagined_actions.detach()), -1)
+            torch.cat((latent_states.detach(), actions.detach()), -1)
         )
 
     # next_state_embedding -> N_ensemble x Horizon x Batch_size*Seq_len x Obs_embedding_size
     # 결과적으로 reward가 여기서 주어지네.     
     reward = next_state_embedding.var(0).mean(-1, keepdim=True) * cfg.algo.intrinsic_reward_multiplier
-    values = ppo_agent.critic(imagined_trajectories)
+    values = ppo_agent.critic(latent_states)
         
     # Compute continues
-    continues = Independent(BernoulliSafeMode(logits=world_model.continue_model(imagined_trajectories)), 1).mode
-    print(f"before_continues shape: {continues.shape}")  
-    true_continue = (1 - data["terminated"]).flatten().reshape(1, -1, 1)
+    continues = Independent(BernoulliSafeMode(logits=world_model.continue_model(latent_states)), 1).mode
+    print(f"before_continues shape: {continues.shape}")   
+    true_continue = (1 - data["terminated"])
+    print("true_continue:",true_continue.shape)
     continues = torch.cat((true_continue, continues[1:]))
     
     print(f"reward shape: {reward.shape}")
     print(f"values shape: {values.shape}")
     print(f"continues shape: {continues.shape}")   
     print(f"imagined_trajectories: {imagined_trajectories.shape}")
-    #reward shape: torch.Size([16, 512, 1])
+    # reward shape: torch.Size([16, 512, 1])
     # values shape: torch.Size([16, 512, 1])
     # continues shape: torch.Size([16, 512, 1])
     # imagined_trajectories: torch.Size([16, 512, 5120])
     
     # Compute GAE
-    num_steps = cfg.algo.horizon + 1  # +1은 초기 상태를 포함하기 위함
-
+    num_steps = sequence_length  
+    
     returns, advantages = gae_worldmodel(
         rewards=reward,  
         values=values,   
@@ -269,27 +272,30 @@ def train(
         aggregator.update("Advantages/gae", advantages.detach().cpu().mean())
 
     ppo_agent_optimizer.zero_grad(set_to_none=True)
-    #imagined_trajectories는 상상된 미래 상태들을 포함하고 있으며, 이는 현재의 ppo_agent 정책을 기반으로 생성
-    current_actions, current_log_probs, entropy, current_values = ppo_agent(imagined_trajectories.detach())
     
+    print("latent_states_shape:",latent_states.shape) #각 sequence_length, batch_size만큼의 5120 latent_state가 있다.
+    _, current_log_probs, entropy, current_values = ppo_agent(latent_states.detach())
+
     if old_ppo_agent is None:
         old_ppo_agent = ppo_agent
         
     with torch.no_grad():
-        old_actions, old_log_probs, _, _ = old_ppo_agent(imagined_trajectories.detach())
+        _, old_log_probs, _, _ = old_ppo_agent(latent_states.detach())
 
-    # Debugging shapes and types
-    print(f"current_actions type: {type(current_actions)}")
-    print(f"current_actions shape: {current_actions.shape}")
-    print(f"old_actions shape: {old_actions.shape}")
+    # print(f"current_actions type: {type(current_actions)}")
+    # print(f"current_actions shape: {current_actions.shape}")
+    # print(f"old_actions shape: {old_actions.shape}")
 
-    print("current_log_probs:",current_log_probs.shape)
-    print("old_log_probs:",old_log_probs.shape)
+    # print("current_log_probs:",current_log_probs.shape)
+    # print("old_log_probs:",old_log_probs.shape)
+    
 
     # PPO의 policy loss 계산
     ratio = torch.exp(current_log_probs - old_log_probs)
+    
     print("ratio:",ratio.shape)
     print("advantages:",advantages.shape)
+    
     surr1 = ratio * advantages
     
     cfg.algo.clip_range = 0.01

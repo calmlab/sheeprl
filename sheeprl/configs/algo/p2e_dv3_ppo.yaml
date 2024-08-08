@@ -19,7 +19,7 @@ critics_exploration:
 
 gae_lambda: 0.95
 ensembles:
-  n: 3 # the number of the ensembles
+  n: 4 # the number of the ensembles
   dense_act: ${algo.dense_act}
   mlp_layers: ${algo.mlp_layers}
   dense_units: ${algo.dense_units}

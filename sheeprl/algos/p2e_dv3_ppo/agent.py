@@ -105,31 +105,7 @@ class PPOAgent(nn.Module):
             else:
                 self.distribution = "discrete"
         self.actions_dim = actions_dim
-        # actor_backbone = (
-        #     MLP(
-        #         input_dims=latent_state_size,
-        #         output_dim=None,
-        #         hidden_sizes=[actor_cfg.dense_units] * actor_cfg.mlp_layers,
-        #         activation=hydra.utils.get_class(actor_cfg.dense_act),
-        #         flatten_dim=None,
-        #         norm_layer=[nn.LayerNorm] * actor_cfg.mlp_layers if actor_cfg.layer_norm else None,
-        #         norm_args=(
-        #             [{"normalized_shape": actor_cfg.dense_units} for _ in range(actor_cfg.mlp_layers)]
-        #             if actor_cfg.layer_norm
-        #             else None
-        #         ),
-        #     )
-        #     if actor_cfg.mlp_layers > 0
-        #     else nn.Identity()
-        # )
-        
         #각 행동 차원에 대해 두 개의 값을 출력: 평균(μ)과 표준편차(σ)의 로그값이 필요하니깐 곱하기 2를 해주고,  출력된 평균과 표준편차로 정규 분포를 정의한 걸 바탕으로 action의 분포를 구한다음 거기에서 샘플링.
-        
-        if is_continuous:
-            actor_heads = nn.ModuleList([nn.Linear(actor_cfg.dense_units, sum(actions_dim) * 2)]) 
-        else:
-            actor_heads = nn.ModuleList([nn.Linear(actor_cfg.dense_units, action_dim) for action_dim in actions_dim]) #dense layer에서 softmax처럼 heads를 구성
-        #self.actor = PPOActor(actor_backbone, actor_heads, is_continuous, self.distribution)
         self.actor = Actor(
             latent_state_size=latent_state_size,
             actions_dim=actions_dim,
@@ -183,52 +159,74 @@ class PPOAgent(nn.Module):
         return tanh_actions, log_prob.unsqueeze(dim=-1), normal.entropy().unsqueeze(dim=-1)
     
     def forward(
-        self, latent_state: Tensor, actions: Optional[List[Tensor]] = None
+        self, latent_states: Tensor, actions: Optional[List[Tensor]] = None
     ) -> Tuple[Sequence[Tensor], Tensor, Tensor, Tensor]:
-        print("latent_state:", latent_state.shape)
-        actor_out, action_dists = self.actor(latent_state)
-        values = self.critic(latent_state)
-        print("values:",values)
-        
-        if self.is_continuous:
-            if self.distribution == "normal":
-                actions, log_prob, entropy = self._normal(actor_out[0], actions)
-            elif self.distribution == "tanh_normal":
-                actions, log_prob, entropy = self._tanh_normal(actor_out[0], actions)
-            return tuple([actions]), log_prob, entropy, values
-        else:
-            # should_append가 discrete action space에서 새로운 행동을 샘플링해야하는지에 대한 여부를 확인.
-            should_append = False
-            actions_logprobs: List[Tensor] = []
-            actions_entropies: List[Tensor] = []
-            actions_dist: List[Distribution] = action_dists
-            if actions is None:
-                should_append = True
-                actions = []
-            
-            for i, dist in enumerate(actions_dist):
-                actions_entropies.append(dist.entropy()) # 나중에 entropy bonus 등을 계산하기 위해서.
-                if should_append:
-                    actions.append(dist.sample())
-                log_prob = dist.log_prob(actions[i])
-                actions_logprobs.append(log_prob)
-            
-            if isinstance(actions, list):
-                actions = torch.cat(actions, dim=-1)
-            
-            return (
-                actions,
-                torch.stack(actions_logprobs, dim=-1).sum(dim=-1, keepdim=True),
-                torch.stack(actions_entropies, dim=-1).sum(dim=-1, keepdim=True),
-                values,
-            )
+        sequence_length, batch_size, latent_state = latent_states.shape
 
+        all_actions = []
+        all_log_probs = []
+        all_entropies = []
+        all_values = []
+
+        for t in range(sequence_length):
+            latent_state = latent_states[t]
+
+            actor_out, action_dists = self.actor(latent_state)
+            values = self.critic(latent_state)
+
+            if self.is_continuous:
+                if self.distribution == "normal":
+                    actions, log_prob, entropy = self._normal(actor_out[0], actions)
+                elif self.distribution == "tanh_normal":
+                    actions, log_prob, entropy = self._tanh_normal(actor_out[0], actions)
+                
+                all_actions.append(actions)
+                all_log_probs.append(log_prob)
+                all_entropies.append(entropy)
+                all_values.append(values)
+            else:
+                should_append = False
+                actions_logprobs: List[Tensor] = []
+                actions_entropies: List[Tensor] = []
+                actions_dist: List[Distribution] = action_dists
+
+                if actions is None:
+                    should_append = True
+                    actions = []
+
+                for i, dist in enumerate(actions_dist):
+                    actions_entropies.append(dist.entropy())  # 나중에 entropy bonus 등을 계산하기 위해서.
+                    if should_append:
+                        actions.append(dist.sample())
+                    log_prob = dist.log_prob(actions[i])
+                    actions_logprobs.append(log_prob)
+
+                if isinstance(actions, list):
+                    actions = torch.cat(actions, dim=-1)
+
+                all_actions.append(actions)
+                all_log_probs.append(torch.stack(actions_logprobs, dim=-1).sum(dim=-1, keepdim=True))
+                all_entropies.append(torch.stack(actions_entropies, dim=-1).sum(dim=-1, keepdim=True))
+                all_values.append(values)
+
+        # 시퀀스 길이 차원 추가
+        all_log_probs = torch.stack(all_log_probs)
+        all_entropies = torch.stack(all_entropies)
+        all_values = torch.stack(all_values)
+        
+        return (
+            torch.stack(all_actions),  # [sequence_length, batch_size, ...]
+            all_log_probs,             # [sequence_length, batch_size, 1]
+            all_entropies,             # [sequence_length, batch_size, 1]
+            all_values                 # [sequence_length, batch_size, ...]
+        )
+        
     # def forward(
     #     self, latent_state: Tensor, actions: Optional[List[Tensor]] = None
     # ) -> Tuple[Sequence[Tensor], Tensor, Tensor, Tensor]:
-    #     print("latent_state:",latent_state.shape)
-    #     actor_out: List[Tensor] = self.actor(latent_state)
+    #     actor_out, action_dists = self.actor(latent_state)
     #     values = self.critic(latent_state)
+        
     #     if self.is_continuous:
     #         if self.distribution == "normal":
     #             actions, log_prob, entropy = self._normal(actor_out[0], actions)
@@ -240,19 +238,21 @@ class PPOAgent(nn.Module):
     #         should_append = False
     #         actions_logprobs: List[Tensor] = []
     #         actions_entropies: List[Tensor] = []
-    #         actions_dist: List[Distribution] = []
+    #         actions_dist: List[Distribution] = action_dists
     #         if actions is None:
     #             should_append = True
-    #             actions: List[Tensor] = []
-    #         for i, logits in enumerate(actor_out):
-    #             actions_dist.append(OneHotCategorical(logits=logits))
-    #             actions_entropies.append(actions_dist[-1].entropy()) #나중에 이거가지고 탐색(Exploration)과 활용(Exploitation)의 균형을 주기 위해서 entropy bonus같은 거 계산하기 위함인듯.
+    #             actions = []
+            
+    #         for i, dist in enumerate(actions_dist):
+    #             actions_entropies.append(dist.entropy()) # 나중에 entropy bonus 등을 계산하기 위해서.
     #             if should_append:
-    #                 actions.append(actions_dist[-1].sample())
-    #             actions_logprobs.append(actions_dist[-1].log_prob(actions[i])) 
-    #             if isinstance(actions, list):
-    #                 actions = torch.cat(actions, dim=-1)
-    #             print(f"actions shape in forward: {actions.shape if isinstance(actions, torch.Tensor) else [a.shape for a in actions]}")
+    #                 actions.append(dist.sample())
+    #             log_prob = dist.log_prob(actions[i])
+    #             actions_logprobs.append(log_prob)
+            
+    #         if isinstance(actions, list):
+    #             actions = torch.cat(actions, dim=-1)
+            
     #         return (
     #             actions,
     #             torch.stack(actions_logprobs, dim=-1).sum(dim=-1, keepdim=True),

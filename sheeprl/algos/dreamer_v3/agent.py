@@ -578,6 +578,7 @@ class DecoupledRSSM(RSSM):
         action = (1 - is_first) * action
 
         initial_recurrent_state, initial_posterior = self.get_initial_states(recurrent_state.shape[:2])
+        print("initial_posterior:",initial_posterior.shape)
         recurrent_state = (1 - is_first) * recurrent_state + is_first * initial_recurrent_state
         posterior = posterior.view(*posterior.shape[:-2], -1)
         posterior = (1 - is_first) * posterior + is_first * initial_posterior.view_as(posterior)
