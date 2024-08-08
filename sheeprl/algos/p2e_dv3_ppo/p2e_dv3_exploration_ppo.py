@@ -2,7 +2,7 @@ import copy
 import time
 import os
 import warnings
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Sequence, Optional
 
 import gymnasium as gym
 import hydra
@@ -15,11 +15,12 @@ from omegaconf import DictConfig
 from torch import Tensor, nn
 from torch.distributions import Distribution, Independent, OneHotCategorical
 from torchmetrics import SumMetric
-
+from sheeprl.algos.p2e_dv3_ppo.agent import PPOAgent
+from sheeprl.utils.utils import gae_worldmodel
 from sheeprl.algos.dreamer_v3.agent import WorldModel
 from sheeprl.algos.dreamer_v3.loss import reconstruction_loss
 from sheeprl.algos.dreamer_v3.utils import Moments, compute_lambda_values, prepare_obs, test
-from sheeprl.algos.p2e_dv3.agent import build_agent
+from sheeprl.algos.p2e_dv3_ppo.agent import build_agent
 from sheeprl.data.buffers import EnvIndependentReplayBuffer, SequentialReplayBuffer
 from sheeprl.utils.distribution import (
     BernoulliSafeMode,
@@ -41,70 +42,18 @@ from sheeprl.utils.utils import Ratio, save_configs, unwrap_fabric
 def train(
     fabric: Fabric,
     world_model: WorldModel,
-    actor_task: _FabricModule,
-    critic_task: _FabricModule,
-    target_critic_task: nn.Module,
+    ppo_agent: PPOAgent,
+    old_ppo_agent: Optional[PPOAgent],
+    ensembles: _FabricModule,
     world_optimizer: _FabricOptimizer,
-    actor_task_optimizer: _FabricOptimizer,
-    critic_task_optimizer: _FabricOptimizer,
+    ppo_agent_optimizer: _FabricOptimizer,
+    ensemble_optimizer: _FabricOptimizer,
     data: Dict[str, Tensor],
     aggregator: MetricAggregator,
     cfg: DictConfig,
-    ensembles: _FabricModule,
-    ensemble_optimizer: _FabricOptimizer,
-    actor_exploration: _FabricModule,
-    critics_exploration: Dict[str, Dict[str, Any]],
-    actor_exploration_optimizer: _FabricOptimizer,
-    moments_exploration: Dict[str, Moments],
-    moments_task: Moments,
     is_continuous: bool,
     actions_dim: Sequence[int],
 ) -> None:
-    """Runs one-step update of the agent.
-
-    In particular, it updates the agent as specified by Algorithm 1 in
-    [Planning to Explore via Self-Supervised World Models](https://arxiv.org/abs/2005.05960).
-
-    The algorithm is made by different phases:
-    1. Dynamic Learning: see Algorithm 1 in
-        [Dream to Control: Learning Behaviors by Latent Imagination](https://arxiv.org/abs/1912.01603)
-    2. Ensemble Learning: learn the ensemble models as described in
-        [Planning to Explore via Self-Supervised World Models](https://arxiv.org/abs/2005.05960).
-        The ensemble models give the novelty of the state visited by the agent.
-    3. Behaviour Learning Exploration: the agent learns to explore the environment,
-        having as reward only the intrinsic reward, computed from the ensembles.
-    4. Behaviour Learning Task (zero-shot): the agent learns to solve the task,
-        the experiences it uses to learn it are the ones collected during the exploration:
-        - Imagine trajectories in the latent space from each latent state
-        s_t up to the horizon H: s'_(t+1), ..., s'_(t+H).
-        - Predict rewards and values in the imagined trajectories.
-        - Compute lambda targets (Eq. 6 in [https://arxiv.org/abs/1912.01603](https://arxiv.org/abs/1912.01603))
-        - Update the actor and the critic
-
-    This method is based on [sheeprl.algos.dreamer_v3.dreamer_v3](sheeprl.algos.dreamer_v3.dreamer_v3) algorithm,
-    extending it to implement the
-    [Planning to Explore via Self-Supervised World Models](https://arxiv.org/abs/2005.05960).
-
-    Args:
-        fabric (Fabric): the fabric instance.
-        world_model (WorldModel): the world model wrapped with Fabric.
-        actor_task (_FabricModule): the actor for solving the task.
-        critic_task (_FabricModule): the critic for solving the task.
-        target_critic_task (nn.Module): the target critic for solving the task.
-        world_optimizer (_FabricOptimizer): the world optimizer.
-        actor_task_optimizer (_FabricOptimizer): the actor optimizer for solving the task.
-        critic_task_optimizer (_FabricOptimizer): the critic optimizer for solving the task.
-        data (Dict[str, Tensor]): the batch of data to use for training.
-        aggregator (MetricAggregator): the aggregator to print the metrics.
-        cfg (DictConfig): the configs.
-        ensembles (_FabricModule): the ensemble models.
-        ensemble_optimizer (_FabricOptimizer): the optimizer of the ensemble models.
-        actor_exploration (_FabricModule): the actor for exploration.
-        critics_exploration (Dict[str, Dict[str, Any]]): the critic for exploration.
-        actor_exploration_optimizer (_FabricOptimizer): the optimizer of the actor for exploration.
-        is_continuous (bool): whether or not are continuous actions.
-        actions_dim (Sequence[int]): the actions dimension.
-    """
     batch_size = cfg.algo.per_rank_batch_size
     sequence_length = cfg.algo.per_rank_sequence_length
     recurrent_state_size = cfg.algo.world_model.recurrent_model.recurrent_state_size
@@ -141,15 +90,7 @@ def train(
         priors_logits[i] = prior_logits
         posteriors[i] = posterior
         posteriors_logits[i] = posterior_logits
-    latent_states = torch.cat((posteriors.view(*posteriors.shape[:-2], -1), recurrent_states), -1) #이게 왜 이렇게..?
-    
-        # recurrent_state: torch.Size([1, 16, 4096])
-        # posteriors: torch.Size([64, 16, 32, 32]) #seq_len, batch_size, stoch, discrete
-        # posterior_logits: torch.Size([1, 16, 1024]) #32*32
-        # latent_states: torch.Size([64, 16, 5120]) #4096 + 1024 
-        
-    # compute predictions for the observationss
-    #latent variable에서 관찰을 재구성하고, 재구성된 관찰에 대한 분포를 계산해서 보상과 종료 여부도 분포로 계산
+    latent_states = torch.cat((posteriors.view(*posteriors.shape[:-2], -1), recurrent_states), -1)
     reconstructed_obs: Dict[str, torch.Tensor] = world_model.observation_model(latent_states) #torch.Size([64, 16, 3, 64, 64])
 
     # compute the distribution over the reconstructed observations
@@ -163,9 +104,6 @@ def train(
             for k in cfg.algo.mlp_keys.decoder
         }
     )
-    #po['rgb'].mean.shape -> torch.Size([64, 16, 3, 64, 64])
-    #po['rgb'].mode.shape -> torch.Size([64, 16, 3, 64, 64])
-    
     # Compute the distribution over the rewards #reward predictor
     pr = TwoHotEncodingDistribution(world_model.reward_model(latent_states.detach()), dims=1) #torch.Size([64, 16, 1])
 
@@ -262,11 +200,12 @@ def train(
         device=device,
     )
     #deterministic하면 True, 아니면 False
-    greedy = cfg.algo.deterministic_actions
+    # greedy = cfg.algo.deterministic_actions
     
-    actions = torch.cat(actor_exploration(imagined_latent_state.detach(),greedy=greedy)[0], dim=-1)
+    actions, _, _, _ = ppo_agent(imagined_latent_state.detach()) 
+    print("actions shape:", [a.shape for a in actions]) 
+    print("imagined_actions shape:", imagined_actions.shape)
         
-    # print("actions:",actions.shape)
     imagined_actions[0] = actions
 
     # imagine trajectories in the latent space
@@ -276,241 +215,117 @@ def train(
         imagined_prior = imagined_prior.view(1, -1, stoch_state_size)
         imagined_latent_state = torch.cat((imagined_prior, recurrent_state), -1)
         imagined_trajectories[i] = imagined_latent_state
-        actions = torch.cat(actor_exploration(imagined_latent_state.detach(), greedy=greedy)[0], dim=-1)
+        actions, _, _, _ = ppo_agent(imagined_latent_state.detach())
         imagined_actions[i] = actions
 
-    advantages = []
-    weights_sum = sum([c["weight"] for c in critics_exploration.values()])
-    for k, critic in critics_exploration.items():
-        # Predict values and continues
-        predicted_values = TwoHotEncodingDistribution(critic["module"](imagined_trajectories), dims=1).mean #현재 critic에서 예측한 value의 평균
-        continues = Independent(BernoulliSafeMode(logits=world_model.continue_model(imagined_trajectories)), 1).mode #continue predictor
-        true_continue = (1 - data["terminated"]).flatten().reshape(1, -1, 1) #실제 종료 여부 종료면 1 아니면 0
-        continues = torch.cat((true_continue, continues[1:])) 
 
-        if critic["reward_type"] == "intrinsic":
-            # Predict intrinsic reward
-            next_state_embedding = torch.empty(
-                len(ensembles),
-                cfg.algo.horizon + 1,
-                batch_size * sequence_length,
-                stochastic_size * discrete_size,
-                device=device,
-            )
-            for i, ens in enumerate(ensembles):
-                next_state_embedding[i] = ens(
-                    torch.cat((imagined_trajectories.detach(), imagined_actions.detach()), -1)
-                )
+    next_state_embedding = torch.empty(
+        len(ensembles),
+        cfg.algo.horizon + 1,
+        batch_size * sequence_length,
+        stochastic_size * discrete_size,
+        device=device,
+    )
+    for i, ens in enumerate(ensembles):
+        next_state_embedding[i] = ens(
+            torch.cat((imagined_trajectories.detach(), imagined_actions.detach()), -1)
+        )
 
-            # next_state_embedding -> N_ensemble x Horizon x Batch_size*Seq_len x Obs_embedding_size
-            # 결과적으로 reward가 여기서 주어지네. 
-            reward = next_state_embedding.var(0).mean(-1, keepdim=True) * cfg.algo.intrinsic_reward_multiplier
-            if aggregator and not aggregator.disabled:
-                aggregator.update(f"Rewards/intrinsic_{k}", reward.detach().cpu().mean())
-        else:
-            reward = TwoHotEncodingDistribution(world_model.reward_model(imagined_trajectories), dims=1).mean
+    # next_state_embedding -> N_ensemble x Horizon x Batch_size*Seq_len x Obs_embedding_size
+    # 결과적으로 reward가 여기서 주어지네.     
+    reward = next_state_embedding.var(0).mean(-1, keepdim=True) * cfg.algo.intrinsic_reward_multiplier
+    values = ppo_agent.critic(imagined_trajectories)
         
-        #critic을 계산하는 산식이 이렇다는 것이고,
-        #이렇게 계산한 advantage를 바탕으로 actor의 policy를 평가하겠다.
+    # Compute continues
+    continues = Independent(BernoulliSafeMode(logits=world_model.continue_model(imagined_trajectories)), 1).mode
+    print(f"before_continues shape: {continues.shape}")  
+    true_continue = (1 - data["terminated"]).flatten().reshape(1, -1, 1)
+    continues = torch.cat((true_continue, continues[1:]))
     
-        lambda_values = compute_lambda_values(
-            reward[1:],
-            predicted_values[1:],
-            continues[1:] * cfg.algo.gamma,
-            lmbda=cfg.algo.lmbda,
-        )
-        critic["lambda_values"] = lambda_values
-        baseline = predicted_values[:-1]
-        offset, invscale = moments_exploration[k](lambda_values, fabric)
-        normed_lambda_values = (lambda_values - offset) / invscale
-        normed_baseline = (baseline - offset) / invscale
-        advantages.append((normed_lambda_values - normed_baseline) * critic["weight"] / weights_sum)
+    print(f"reward shape: {reward.shape}")
+    print(f"values shape: {values.shape}")
+    print(f"continues shape: {continues.shape}")   
+    print(f"imagined_trajectories: {imagined_trajectories.shape}")
+    #reward shape: torch.Size([16, 512, 1])
+    # values shape: torch.Size([16, 512, 1])
+    # continues shape: torch.Size([16, 512, 1])
+    # imagined_trajectories: torch.Size([16, 512, 5120])
+    
+    # Compute GAE
+    num_steps = cfg.algo.horizon + 1  # +1은 초기 상태를 포함하기 위함
 
-        if aggregator and not aggregator.disabled:
-            aggregator.update(f"Values_exploration/predicted_values_{k}", predicted_values.detach().cpu().mean())
-            aggregator.update(f"Values_exploration/lambda_values_{k}", lambda_values.detach().cpu().mean())
+    returns, advantages = gae_worldmodel(
+        rewards=reward,  
+        values=values,   
+        continues=continues * cfg.algo.gamma, 
+        num_steps=num_steps,
+        gamma=cfg.algo.gamma,
+        gae_lambda=cfg.algo.gae_lambda
+    )
 
-    advantage = torch.stack(advantages, dim=0).sum(dim=0)
-    with torch.no_grad():
-        discount = torch.cumprod(continues * cfg.algo.gamma, dim=0) / cfg.algo.gamma
+    if aggregator and not aggregator.disabled:
+        aggregator.update("Rewards/intrinsic", reward.detach().cpu().mean())
+        aggregator.update("Values/predicted", values.detach().cpu().mean())
+        aggregator.update("Advantages/gae", advantages.detach().cpu().mean())
 
-    actor_exploration_optimizer.zero_grad(set_to_none=True)
-
-    #actor_exploration의 policy
-    policies: Sequence[Distribution] = actor_exploration(imagined_trajectories.detach())[1]
-    if is_continuous:
-        objective = advantage
-    else:
-        objective = (
-            torch.stack(
-                [
-                    p.log_prob(imgnd_act.detach()).unsqueeze(-1)[:-1]
-                    for p, imgnd_act in zip(policies, torch.split(imagined_actions, actions_dim, dim=-1))
-                ],
-                dim=-1,
-            ).sum(dim=-1)
-            * advantage.detach()
-        )
+    ppo_agent_optimizer.zero_grad(set_to_none=True)
+    #imagined_trajectories는 상상된 미래 상태들을 포함하고 있으며, 이는 현재의 ppo_agent 정책을 기반으로 생성
+    current_actions, current_log_probs, entropy, current_values = ppo_agent(imagined_trajectories.detach())
+    
+    if old_ppo_agent is None:
+        old_ppo_agent = ppo_agent
         
-    try:
-        entropy = cfg.algo.actor.ent_coef * torch.stack([p.entropy() for p in policies], -1).sum(dim=-1)
-    except NotImplementedError:
-        entropy = torch.zeros_like(objective)
+    with torch.no_grad():
+        old_actions, old_log_probs, _, _ = old_ppo_agent(imagined_trajectories.detach())
 
-    policy_loss_exploration = -torch.mean(discount[:-1].detach() * (objective + entropy.unsqueeze(dim=-1)[:-1]))
+    # Debugging shapes and types
+    print(f"current_actions type: {type(current_actions)}")
+    print(f"current_actions shape: {current_actions.shape}")
+    print(f"old_actions shape: {old_actions.shape}")
+
+    print("current_log_probs:",current_log_probs.shape)
+    print("old_log_probs:",old_log_probs.shape)
+
+    # PPO의 policy loss 계산
+    ratio = torch.exp(current_log_probs - old_log_probs)
+    print("ratio:",ratio.shape)
+    print("advantages:",advantages.shape)
+    surr1 = ratio * advantages
+    
+    cfg.algo.clip_range = 0.01
+    
+    surr2 = torch.clamp(ratio, 1.0 - cfg.algo.clip_range, 1.0 + cfg.algo.clip_range) * advantages
+    policy_loss = -torch.min(surr1, surr2).mean()
+    
+    # 엔트로피 보너스 계산
+    try:
+        entropy_bonus = cfg.algo.actor.ent_coef * entropy.mean()
+    except NotImplementedError:
+        entropy_bonus = torch.zeros_like(policy_loss)
+
+    policy_loss_exploration = policy_loss - entropy_bonus
     fabric.backward(policy_loss_exploration)
+
     actor_grads_exploration = None
     if cfg.algo.actor.clip_gradients is not None and cfg.algo.actor.clip_gradients > 0:
         actor_grads_exploration = fabric.clip_gradients(
-            module=actor_exploration,
-            optimizer=actor_exploration_optimizer,
+            module=ppo_agent,
+            optimizer=ppo_agent_optimizer,
             max_norm=cfg.algo.actor.clip_gradients,
             error_if_nonfinite=False,
         )
-    actor_exploration_optimizer.step()
-
-    for k, critic in critics_exploration.items():
-        qv = TwoHotEncodingDistribution(critic["module"](imagined_trajectories.detach()[:-1]), dims=1)
-        with torch.no_grad():
-            predicted_target_values_expl = TwoHotEncodingDistribution(
-                critic["target_module"](imagined_trajectories.detach()[:-1]), dims=1
-            ).mean
-        # Critic optimization. Eq. 10 in the paper
-        critic["optimizer"].zero_grad(set_to_none=True)
-        value_loss = -qv.log_prob(critic["lambda_values"].detach())
-        value_loss = value_loss - qv.log_prob(predicted_target_values_expl.detach())
-        value_loss = torch.mean(value_loss * discount[:-1].squeeze(-1))
-
-        fabric.backward(value_loss)
-        critic_grads_exploration = None
-        if cfg.algo.critic.clip_gradients is not None and cfg.algo.critic.clip_gradients > 0:
-            critic_grads_exploration = fabric.clip_gradients(
-                module=critic["module"],
-                optimizer=critic["optimizer"],
-                max_norm=cfg.algo.critic.clip_gradients,
-                error_if_nonfinite=False,
-            )
-        critic["optimizer"].step()
-        if aggregator and not aggregator.disabled:
-            if critic_grads_exploration:
-                aggregator.update(f"Grads/critic_exploration_{k}", critic_grads_exploration.mean().detach())
-            aggregator.update(f"Loss/value_loss_exploration_{k}", value_loss.detach())
-
+    ppo_agent_optimizer.step()
+    
+    #value loss 계산
+    #현재 스텝의 보상 + 다음 스텝의 예측된 값 * 에피소드 지속여부
+    #true_values = reward[:-1] + cfg.algo.gamma * values[1:] * continues[1:]
+    
+    value_loss = F.mse_loss(current_values, returns)
+    fabric.backward(value_loss)
+    
     # reset the world_model gradients, to avoid interferences with task learning
     world_optimizer.zero_grad(set_to_none=True)
-
-    # Behaviour Learning Task
-    imagined_prior = posteriors.detach().reshape(1, -1, stoch_state_size)
-    recurrent_state = recurrent_states.detach().reshape(1, -1, recurrent_state_size)
-    imagined_latent_state = torch.cat((imagined_prior, recurrent_state), -1)
-    imagined_trajectories = torch.empty(
-        cfg.algo.horizon + 1,
-        batch_size * sequence_length,
-        stoch_state_size + recurrent_state_size,
-        device=device,
-    )
-    imagined_trajectories[0] = imagined_latent_state
-    imagined_actions = torch.empty(
-        cfg.algo.horizon + 1,
-        batch_size * sequence_length,
-        data["actions"].shape[-1],
-        device=device,
-    )
-    actions = torch.cat(actor_task(imagined_latent_state.detach(), greedy=greedy)[0], dim=-1)
-    imagined_actions[0] = actions
-
-    # imagine trajectories in the latent space
-    for i in range(1, cfg.algo.horizon + 1):
-        imagined_prior, recurrent_state = world_model.rssm.imagination(imagined_prior, recurrent_state, actions)
-        imagined_prior = imagined_prior.view(1, -1, stoch_state_size)
-        imagined_latent_state = torch.cat((imagined_prior, recurrent_state), -1)
-        imagined_trajectories[i] = imagined_latent_state
-        actions = torch.cat(actor_task(imagined_latent_state.detach(), greedy=greedy)[0], dim=-1)
-        imagined_actions[i] = actions
-
-    # Predict values, rewards and continues
-    predicted_values = TwoHotEncodingDistribution(critic_task(imagined_trajectories), dims=1).mean
-    predicted_rewards = TwoHotEncodingDistribution(world_model.reward_model(imagined_trajectories), dims=1).mean
-    continues = Independent(BernoulliSafeMode(logits=world_model.continue_model(imagined_trajectories)), 1).mode
-    true_continue = (1 - data["terminated"]).flatten().reshape(1, -1, 1)
-    continues = torch.cat((true_continue, continues[1:]))
-
-    lambda_values = compute_lambda_values(
-        predicted_rewards[1:],
-        predicted_values[1:],
-        continues[1:] * cfg.algo.gamma,
-        lmbda=cfg.algo.lmbda,
-    )
-
-    # Compute the discounts to multiply the lambda values to
-    with torch.no_grad():
-        discount = torch.cumprod(continues * cfg.algo.gamma, dim=0) / cfg.algo.gamma
     
-    #actor_task의 업데이트.
-    
-    actor_task_optimizer.zero_grad(set_to_none=True)
-    policies: Sequence[Distribution] = actor_task(imagined_trajectories.detach())[1] #actor task가 imagined_trajectories를 보고 어떤 정책으로 그것을 예측
-
-    baseline = predicted_values[:-1]
-    offset, invscale = moments_task(lambda_values, fabric)
-    normed_lambda_values = (lambda_values - offset) / invscale
-    normed_baseline = (baseline - offset) / invscale
-    advantage = normed_lambda_values - normed_baseline
-    if is_continuous:
-        objective = advantage
-    else:
-        objective = (
-            torch.stack(
-                [
-                    p.log_prob(imgnd_act.detach()).unsqueeze(-1)[:-1]
-                    for p, imgnd_act in zip(policies, torch.split(imagined_actions, actions_dim, dim=-1))
-                ],
-                dim=-1,
-            ).sum(dim=-1)
-            * advantage.detach()
-        )
-    try:
-        entropy = cfg.algo.actor.ent_coef * torch.stack([p.entropy() for p in policies], -1).sum(dim=-1)
-    except NotImplementedError:
-        entropy = torch.zeros_like(objective)
-    policy_loss_task = -torch.mean(discount[:-1].detach() * (objective + entropy.unsqueeze(dim=-1)[:-1]))
-    fabric.backward(policy_loss_task)
-    actor_grads_task = None
-    if cfg.algo.actor.clip_gradients is not None and cfg.algo.actor.clip_gradients > 0:
-        actor_grads_task = fabric.clip_gradients(
-            module=actor_task,
-            optimizer=actor_task_optimizer,
-            max_norm=cfg.algo.actor.clip_gradients,
-            error_if_nonfinite=False,
-        )
-    actor_task_optimizer.step()
-
-    # Predict the values
-    #Critic 네트워크 update
-    qv = TwoHotEncodingDistribution(critic_task(imagined_trajectories.detach()[:-1]), dims=1) #각 상태에 대한 value를 예측
-    with torch.no_grad(): #target_critic_task가 예측한 value
-        predicted_target_values_tsk = TwoHotEncodingDistribution(
-            target_critic_task(imagined_trajectories.detach()[:-1]), dims=1
-        ).mean
-
-    # Critic optimization. Eq. 10 in the paper
-    critic_task_optimizer.zero_grad(set_to_none=True)
-    value_loss_task = -qv.log_prob(lambda_values.detach()) #예측 값(qv)과 λ-값(lambda_values) 사이의 로그 확률을 계산하여 loss
-    #qv에서 λ-값이 나올 확률의 로그 값을 계산. 이 로그 확률이 높을수록 손실이 낮아지도록 negative
-    value_loss_task = value_loss_task - qv.log_prob(predicted_target_values_tsk.detach()) #목표 값(predicted_target_values_tsk)과 예측 값(qv) 사이의 로그 확률을 추가로 계산하여 손실에 포함
-    value_loss_task = torch.mean(value_loss_task * discount[:-1].squeeze(-1))
-
-    fabric.backward(value_loss_task)
-    critic_grads_task = None
-    if cfg.algo.critic.clip_gradients is not None and cfg.algo.critic.clip_gradients > 0:
-        critic_grads_task = fabric.clip_gradients(
-            module=critic_task,
-            optimizer=critic_task_optimizer,
-            max_norm=cfg.algo.critic.clip_gradients,
-            error_if_nonfinite=False,
-        )
-    critic_task_optimizer.step()
-
     if aggregator and not aggregator.disabled:
         aggregator.update("Loss/world_model_loss", rec_loss.detach())
         aggregator.update("Loss/observation_loss", observation_loss.detach())
@@ -528,27 +343,17 @@ def train(
         )
         aggregator.update("Loss/ensemble_loss", loss.detach().cpu())
         aggregator.update("Loss/policy_loss_exploration", policy_loss_exploration.detach())
-        aggregator.update("Loss/policy_loss_task", policy_loss_task.detach())
-        aggregator.update("Loss/value_loss_task", value_loss_task.detach())
         if world_model_grads:
             aggregator.update("Grads/world_model", world_model_grads.mean().detach())
         if ensemble_grad:
             aggregator.update("Grads/ensemble", ensemble_grad.detach())
         if actor_grads_exploration:
             aggregator.update("Grads/actor_exploration", actor_grads_exploration.mean().detach())
-        if actor_grads_task:
-            aggregator.update("Grads/actor_task", actor_grads_task.mean().detach())
-        if critic_grads_task:
-            aggregator.update("Grads/critic_task", critic_grads_task.mean().detach())
 
     # Reset everything
-    actor_exploration_optimizer.zero_grad(set_to_none=True)
-    actor_task_optimizer.zero_grad(set_to_none=True)
-    critic_task_optimizer.zero_grad(set_to_none=True)
+    ppo_agent_optimizer.zero_grad(set_to_none=True)
     world_optimizer.zero_grad(set_to_none=True)
     ensemble_optimizer.zero_grad(set_to_none=True)
-    for c in critics_exploration.values():
-        c["optimizer"].zero_grad(set_to_none=True)            
 
 
 @register_algorithm()
@@ -628,11 +433,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
     (
         world_model,
         ensembles,
-        actor_task,
-        critic_task,
-        target_critic_task,
-        actor_exploration,
-        critics_exploration,
+        ppo_agent,
         player,
     ) = build_agent(
         fabric,
@@ -642,100 +443,33 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
         observation_space,
         state["world_model"] if cfg.checkpoint.resume_from else None,
         state["ensembles"] if cfg.checkpoint.resume_from else None,
-        state["actor_task"] if cfg.checkpoint.resume_from else None,
-        state["critic_task"] if cfg.checkpoint.resume_from else None,
-        state["target_critic_task"] if cfg.checkpoint.resume_from else None,
-        state["actor_exploration"] if cfg.checkpoint.resume_from else None,
-        state["critics_exploration"] if cfg.checkpoint.resume_from else None,
+        state["agent"] if cfg.checkpoint.resume_from else None,
     )
 
     # Optimizers
     world_optimizer = hydra.utils.instantiate(
         cfg.algo.world_model.optimizer, params=world_model.parameters(), _convert_="all"
     )
-    actor_exploration_optimizer = hydra.utils.instantiate(
-        cfg.algo.actor.optimizer, params=actor_exploration.parameters(), _convert_="all"
-    )
-    for k, critic in critics_exploration.items():
-        critic["optimizer"] = hydra.utils.instantiate(
-            cfg.algo.critic.optimizer, params=critic["module"].parameters(), _convert_="all"
-        )
-    actor_task_optimizer = hydra.utils.instantiate(
-        cfg.algo.actor.optimizer, params=actor_task.parameters(), _convert_="all"
-    )
-    critic_task_optimizer = hydra.utils.instantiate(
-        cfg.algo.critic.optimizer, params=critic_task.parameters(), _convert_="all"
+    ppo_agent_optimizer = hydra.utils.instantiate(
+        cfg.algo.actor.optimizer, params=ppo_agent.parameters(), _convert_="all"
     )
     ensemble_optimizer = hydra.utils.instantiate(
         cfg.algo.critic.optimizer, params=ensembles.parameters(), _convert_="all"
     )
     if cfg.checkpoint.resume_from:
         world_optimizer.load_state_dict(state["world_optimizer"])
-        actor_task_optimizer.load_state_dict(state["actor_task_optimizer"])
-        critic_task_optimizer.load_state_dict(state["critic_task_optimizer"])
+        ppo_agent_optimizer.load_state_dict(state["actor_task_optimizer"])
         ensemble_optimizer.load_state_dict(state["ensemble_optimizer"])
-        actor_exploration_optimizer.load_state_dict(state["actor_exploration_optimizer"])
-        for k, c in critics_exploration.items():
-            c["optimizer"].load_state_dict(state[f"critic_exploration_optimizer_{k}"])
     (
         world_optimizer,
-        actor_task_optimizer,
-        critic_task_optimizer,
+        ppo_agent_optimizer,
         ensemble_optimizer,
-        actor_exploration_optimizer,
     ) = fabric.setup_optimizers(
         world_optimizer,
-        actor_task_optimizer,
-        critic_task_optimizer,
+        ppo_agent_optimizer,
         ensemble_optimizer,
-        actor_exploration_optimizer,
     )
-    for k, critic in critics_exploration.items():
-        critic["optimizer"] = fabric.setup_optimizers(critic["optimizer"])
-
-    moments_exploration = {
-        k: Moments(
-            cfg.algo.actor.moments.decay,
-            cfg.algo.actor.moments.max,
-            cfg.algo.actor.moments.percentile.low,
-            cfg.algo.actor.moments.percentile.high,
-        )
-        for k in critics_exploration.keys()
-    }
-    moments_task = Moments(
-        cfg.algo.actor.moments.decay,
-        cfg.algo.actor.moments.max,
-        cfg.algo.actor.moments.percentile.low,
-        cfg.algo.actor.moments.percentile.high,
-    )
-    if cfg.checkpoint.resume_from:
-        for k, m in moments_exploration.items():
-            m.load_state_dict(state[f"moments_exploration_{k}"])
-        moments_task.load_state_dict(state["moments_task"])
-
-    # Metrics
-    # Since there could be more exploration critics, the key of the critic is added
-    # to the metrics that the user has selected.
-    for k, c in critics_exploration.items():
-        if "Loss/value_loss_exploration" in cfg.metric.aggregator.metrics:
-            cfg.metric.aggregator.metrics[f"Loss/value_loss_exploration_{k}"] = cfg.metric.aggregator.metrics[
-                "Loss/value_loss_exploration"
-            ]
-        if "Values_exploration/predicted_values" in cfg.metric.aggregator.metrics:
-            cfg.metric.aggregator.metrics[f"Values_exploration/predicted_values_{k}"] = cfg.metric.aggregator.metrics[
-                "Values_exploration/predicted_values"
-            ]
-        if "Values_exploration/lambda_values" in cfg.metric.aggregator.metrics:
-            cfg.metric.aggregator.metrics[f"Values_exploration/lambda_values_{k}"] = cfg.metric.aggregator.metrics[
-                "Values_exploration/lambda_values"
-            ]
-        if "Grads/critic_exploration" in cfg.metric.aggregator.metrics:
-            cfg.metric.aggregator.metrics[f"Grads/critic_exploration_{k}"] = cfg.metric.aggregator.metrics[
-                "Grads/critic_exploration"
-            ]
-        if c["reward_type"] == "intrinsic" and "Rewards/intrinsic" in cfg.metric.aggregator.metrics:
-            cfg.metric.aggregator.metrics[f"Rewards/intrinsic_{k}"] = cfg.metric.aggregator.metrics["Rewards/intrinsic"]
-    # Remove general log keys from the aggregator
+    
     cfg.metric.aggregator.metrics.pop("Loss/value_loss_exploration", None)
     cfg.metric.aggregator.metrics.pop("Values_exploration/predicted_values", None)
     cfg.metric.aggregator.metrics.pop("Values_exploration/lambda_values", None)
@@ -823,6 +557,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
     #시뮬레이션
     
     cumulative_per_rank_gradient_steps = 0
+    old_ppo_agent = None
     for iter_num in range(start_iter, total_iters + 1):
         policy_step += policy_steps_per_iter
 
@@ -946,57 +681,26 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                     device=fabric.device,
                     from_numpy=cfg.buffer.from_numpy,
                 )
-                # import pickle
-                # import json
-                # filename = f"sample_data_iter_{iter_num}.pkl"
-                # sample_data_numpy = {key: value.cpu().numpy() if isinstance(value, torch.Tensor) else value for key, value in local_data.items()}
 
-                # # 피클 형식으로 저장
-                # with open(filename, 'wb') as f:
-                #     pickle.dump(sample_data_numpy, f)
-                # print(f"Sample data saved to {filename}")    
-
-                # print(type(local_data))
-                
                 # Start training
                 with timer("Time/train_time", SumMetric, sync_on_compute=cfg.metric.sync_on_compute):
                     for i in range(per_rank_gradient_steps):
                         # 누적 graident_steps에 도달할때마다 타겟 네트워크를 업데이트
-                        if (
-                            cumulative_per_rank_gradient_steps % cfg.algo.critic.per_rank_target_network_update_freq
-                            == 0
-                        ):
-                            tau = 1 if cumulative_per_rank_gradient_steps == 0 else cfg.algo.critic.tau #첫 번째 업데이트에서는 완전히 복사(tau=1)하고, 이후에는 설정된 tau 값을 사용
-                            for cp, tcp in zip(critic_task.module.parameters(), target_critic_task.parameters()):
-                                tcp.data.copy_(tau * cp.data + (1 - tau) * tcp.data) #태스크용 크리틱의 파라미터를 타겟 네트워크로 소프트 업데이트
-                            for k in critics_exploration.keys():
-                                for cp, tcp in zip(
-                                    critics_exploration[k]["module"].module.parameters(),
-                                    critics_exploration[k]["target_module"].parameters(),
-                                ):
-                                    tcp.data.copy_(tau * cp.data + (1 - tau) * tcp.data)
                         batch = {k: v[i].float() for k, v in local_data.items()} #torch.Size([64, 16, 3, 64, 64])
                         train(
                             fabric,
                             world_model,
-                            actor_task,
-                            critic_task,
-                            target_critic_task,
+                            ppo_agent,
+                            old_ppo_agent,
+                            ensembles,
                             world_optimizer,
-                            actor_task_optimizer,
-                            critic_task_optimizer,
+                            ppo_agent_optimizer,
+                            ensemble_optimizer,
                             batch,
                             aggregator,
                             cfg,
-                            ensembles=ensembles,
-                            ensemble_optimizer=ensemble_optimizer,
-                            actor_exploration=actor_exploration,
-                            critics_exploration=critics_exploration,
-                            actor_exploration_optimizer=actor_exploration_optimizer,
                             is_continuous=is_continuous,
                             actions_dim=actions_dim,
-                            moments_exploration=moments_exploration,
-                            moments_task=moments_task,
                         )
                         cumulative_per_rank_gradient_steps += 1
                     train_step += world_size
@@ -1042,37 +746,23 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
             last_train = train_step
 
         # Checkpoint Model
+        old_ppo_agent = copy.deepcopy(ppo_agent)
+        old_ppo_agent.eval()
         if (cfg.checkpoint.every > 0 and policy_step - last_checkpoint >= cfg.checkpoint.every) or (
             iter_num == total_iters and cfg.checkpoint.save_last
         ):
             last_checkpoint = policy_step
-            critics_exploration_state = {"critics_exploration": {}}
-            for k, c in critics_exploration.items():
-                critics_exploration_state["critics_exploration"][k] = {
-                    "module": c["module"].state_dict(),
-                    "target_module": c["target_module"].state_dict(),
-                }
-                critics_exploration_state[f"critic_exploration_optimizer_{k}"] = c["optimizer"].state_dict()
-                critics_exploration_state[f"moments_exploration_{k}"] = moments_exploration[k].state_dict()
             state = {
                 "world_model": world_model.state_dict(),
-                "actor_task": actor_task.state_dict(),
-                "critic_task": critic_task.state_dict(),
-                "target_critic_task": target_critic_task.state_dict(),
+                "actor_task": ppo_agent.state_dict(),
                 "ensembles": ensembles.state_dict(),
                 "world_optimizer": world_optimizer.state_dict(),
-                "actor_task_optimizer": actor_task_optimizer.state_dict(),
-                "critic_task_optimizer": critic_task_optimizer.state_dict(),
                 "ensemble_optimizer": ensemble_optimizer.state_dict(),
                 "ratio": ratio.state_dict(),
                 "iter_num": iter_num * world_size,
                 "batch_size": cfg.algo.per_rank_batch_size * world_size,
-                "actor_exploration": actor_exploration.state_dict(),
-                "actor_exploration_optimizer": actor_exploration_optimizer.state_dict(),
                 "last_log": last_log,
                 "last_checkpoint": last_checkpoint,
-                "moments_task": moments_task.state_dict(),
-                **critics_exploration_state,
             }
             ckpt_path = log_dir + f"/checkpoint/ckpt_{policy_step}_{fabric.global_rank}.ckpt"
             fabric.call(
@@ -1088,7 +778,7 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
     if fabric.is_global_zero and cfg.algo.run_test:
         player.actor_type = "task"
         fabric_player = get_single_device_fabric(fabric)
-        player.actor = fabric_player.setup_module(unwrap_fabric(actor_task))
+        player.actor = fabric_player.setup_module(unwrap_fabric(ppo_agent))
         test(player, fabric, cfg, log_dir, "zero-shot", greedy=False)
 
     if not cfg.model_manager.disabled and fabric.is_global_zero:
@@ -1098,19 +788,6 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
         models_to_log = {
             "world_model": world_model,
             "ensembles": ensembles,
-            "actor_exploration": actor_exploration,
-            "actor_task": actor_task,
-            "critic_task": critic_task,
-            "target_critic_task": target_critic_task,
-            "moments_task": moments_task,
+            "actor_task": ppo_agent,
         }
-        critics_to_log = {}
-        for k, v in critics_exploration.items():
-            critics_to_log["critic_exploration_" + k] = v["module"]
-            critics_to_log["target_critic_exploration_" + k] = v["target_module"]
-        critics_moments_to_log = {}
-        for k, v in moments_exploration.items():
-            critics_moments_to_log["moments_exploration_" + k] = v
-        models_to_log.update(critics_to_log)
-        models_to_log.update(critics_moments_to_log)
         register_model(fabric, log_models, cfg, models_to_log)

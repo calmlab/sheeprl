@@ -105,13 +105,13 @@ class PPOAgent(nn.Module):
         super().__init__()
         self.is_continuous = is_continuous
         self.distribution_cfg = distribution_cfg
-        self.distribution = distribution_cfg.get("type", "auto").lower()
+        self.distribution = distribution_cfg.get("type", "auto").lower() #agent의 action space의 분포.
         if self.distribution not in ("auto", "normal", "tanh_normal", "discrete"):
             raise ValueError(
                 "The distribution must be on of: `auto`, `discrete`, `normal` and `tanh_normal`. "
                 f"Found: {self.distribution}"
             )
-        if self.distribution == "discrete" and is_continuous:
+        if self.distribution == "discrete" and is_continuous: 
             raise ValueError("You have choose a discrete distribution but `is_continuous` is true")
         elif self.distribution not in {"discrete", "auto"} and not is_continuous:
             raise ValueError("You have choose a continuous distribution but `is_continuous` is false")
@@ -141,13 +141,16 @@ class PPOAgent(nn.Module):
             if mlp_keys is not None and len(mlp_keys) > 0
             else None
         )
-        self.feature_extractor = MultiEncoder(cnn_encoder, mlp_encoder)
+        self.feature_extractor = MultiEncoder(cnn_encoder, mlp_encoder) #여기까지는 encoder
+        
+        #feature extractor의 각 모듈들에 대해서 직교행렬로 초기화.
         if encoder_cfg.ortho_init:
             for layer in self.feature_extractor.modules():
                 if isinstance(layer, torch.nn.Linear):
                     torch.nn.init.orthogonal_(layer.weight, 1.0)
                     layer.bias.data.zero_()
         features_dim = self.feature_extractor.output_dim
+        #입력은 특징(features)이고, 출력은 단일 값(가치 추정치), 
         self.critic = MLP(
             input_dims=features_dim,
             output_dim=1,
@@ -177,10 +180,11 @@ class PPOAgent(nn.Module):
             if actor_cfg.mlp_layers > 0
             else nn.Identity()
         )
+        #각 행동 차원에 대해 두 개의 값을 출력합니다: 평균(μ)과 표준편차(σ)의 로그값이 필요하니깐 곱하기 2를 해주고,  출력된 평균과 표준편차로 정규 분포를 정의한 걸 바탕으로 action의 분포를 구한다음 거기에서 샘플링.
         if is_continuous:
-            actor_heads = nn.ModuleList([nn.Linear(actor_cfg.dense_units, sum(actions_dim) * 2)])
+            actor_heads = nn.ModuleList([nn.Linear(actor_cfg.dense_units, sum(actions_dim) * 2)]) 
         else:
-            actor_heads = nn.ModuleList([nn.Linear(actor_cfg.dense_units, action_dim) for action_dim in actions_dim])
+            actor_heads = nn.ModuleList([nn.Linear(actor_cfg.dense_units, action_dim) for action_dim in actions_dim]) #dense layer에서 softmax처럼 heads를 구성
         self.actor = PPOActor(actor_backbone, actor_heads, is_continuous, self.distribution)
 
     def _normal(self, actor_out: Tensor, actions: Optional[List[Tensor]] = None) -> Tuple[Tensor, Tensor, Tensor]:
@@ -218,6 +222,7 @@ class PPOAgent(nn.Module):
                 actions, log_prob, entropy = self._tanh_normal(actor_out[0], actions)
             return tuple([actions]), log_prob, entropy, values
         else:
+            # should_append가 discrete action space에서 새로운 행동을 샘플링해야하는지에 대한 여부를 확인.
             should_append = False
             actions_logprobs: List[Tensor] = []
             actions_entropies: List[Tensor] = []
@@ -227,7 +232,7 @@ class PPOAgent(nn.Module):
                 actions: List[Tensor] = []
             for i, logits in enumerate(actor_out):
                 actions_dist.append(OneHotCategorical(logits=logits))
-                actions_entropies.append(actions_dist[-1].entropy())
+                actions_entropies.append(actions_dist[-1].entropy()) #나중에 이거가지고 탐색(Exploration)과 활용(Exploitation)의 균형을 주기 위해서 entropy bonus같은 거 계산하기 위함인듯.
                 if should_append:
                     actions.append(actions_dist[-1].sample())
                 actions_logprobs.append(actions_dist[-1].log_prob(actions[i]))

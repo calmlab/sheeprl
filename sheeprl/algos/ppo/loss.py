@@ -25,12 +25,15 @@ def policy_loss(
     Returns:
         the policy loss
     """
+    # new_logprobs: 새로운 정책에서의 행동 로그 확률
+    # logprobs: 이전 정책에서의 행동 로그 확률
+    
     logratio = new_logprobs - logprobs
-    ratio = logratio.exp()
+    ratio = logratio.exp() # 새 정책과 이전 정책의 확률 비율을 계산
 
-    pg_loss1 = advantages * ratio
-    pg_loss2 = advantages * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)
-    pg_loss = -torch.min(pg_loss1, pg_loss2)
+    pg_loss1 = advantages * ratio #critic이 계산해준 advantage에 ratio를 곱한다...?
+    pg_loss2 = advantages * torch.clamp(ratio, 1 - clip_coef, 1 + clip_coef)  #clipping된 값을 가지고
+    pg_loss = -torch.min(pg_loss1, pg_loss2) #거기서 clipping된 손실과 클립핑되지 않는 손실중에서 작은 값을 선택하니깐 정책 변화가 작은 경우에는 그냥 pg_loss1을 쓰고, 큰 경우에는 클립핑된 값을 쓴다..!
     reduction = reduction.lower()
     if reduction == "none":
         return pg_loss
@@ -43,16 +46,17 @@ def policy_loss(
 
 
 def value_loss(
-    new_values: Tensor,
+    new_values: Tensor, 
     old_values: Tensor,
     returns: Tensor,
     clip_coef: float,
     clip_vloss: bool,
     reduction: str = "mean",
 ) -> Tensor:
+    #clip_vloss -> value 계산할때 clipping걸꺼냐?
     if not clip_vloss:
-        values_pred = new_values
-        return F.mse_loss(values_pred, returns, reduction=reduction)
+        values_pred = new_values #현재 value function이 예측한 새로운 가치
+        return F.mse_loss(values_pred, returns, reduction=reduction) #이걸 실제 관측된 리턴값이랑 mse_loss를 가지고 계산
     else:
         v_loss_unclipped = (new_values - returns) ** 2
         v_clipped = old_values + torch.clamp(new_values - old_values, -clip_coef, clip_coef)

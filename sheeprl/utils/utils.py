@@ -99,6 +99,44 @@ def gae(
     returns = advantages + values
     return returns, advantages
 
+@torch.no_grad()
+def gae_worldmodel(
+    rewards: Tensor,
+    values: Tensor,
+    continues: Tensor,
+    num_steps: int,
+    gamma: float,
+    gae_lambda: float,
+) -> Tuple[Tensor, Tensor]:
+    """Compute returns and advantages for world model
+
+    Args:
+        rewards (Tensor): all rewards collected from the last rollout
+        values (Tensor): all values collected from the last rollout
+        continues (Tensor): continuation factors (e.g., gamma adjustments)
+        num_steps (int): the number of steps played
+        gamma (float): discount factor
+        gae_lambda (float): lambda for GAE estimation
+
+    Returns:
+        estimated returns
+        estimated advantages
+    """
+    lastgaelam = 0
+    advantages = torch.zeros_like(rewards)
+    #마지막 시간 스텝에서의 GAE 값을 저장해서 lastgaelam이 step을 돌면서 누적됨.
+    #마지막부터 계산해서 미래의 정보를 가지고 현재의 advantage를 계산하겠다.
+    #rewards[t]: 현재 보상, + continues[t] * nextvalues: 다음 상태의 할인된 가치 - values[t]: 현재 상태의 예측 가치
+
+    for t in reversed(range(num_steps)):
+        if t == num_steps - 1:
+            nextvalues = values[-1]
+        else:
+            nextvalues = values[t + 1]
+        delta = rewards[t] + continues[t] * nextvalues - values[t] #에피소드가 종료된 경우에는 다음 상태의 가치를 고려하지말아라.
+        advantages[t] = lastgaelam = delta + continues[t] * lastgaelam * gae_lambda #GAE 계산 시 에피소드가 종료된 경우 이후의 Advantage를 고려하지 않도록
+    returns = advantages + values #[:num_steps]
+    return returns, advantages
 
 def init_weights(m: nn.Module):
     """

@@ -1,7 +1,7 @@
 import copy
 import os
 import warnings
-from typing import Any, Dict, Sequence
+from typing import Any, Dict, Sequence, Optional
 
 import gymnasium as gym
 import hydra
@@ -33,17 +33,42 @@ from sheeprl.utils.metric import MetricAggregator
 from sheeprl.utils.registry import register_algorithm
 from sheeprl.utils.timer import timer
 from sheeprl.utils.utils import Ratio, save_configs, unwrap_fabric
+from sheeprl.algos.p2e_dv3.utils import compute_curiosity_intrinsic_reward
 
 # Decomment the following line if you are using MineDojo on an headless machine
 # os.environ["MINEDOJO_HEADLESS"] = "1"
 
-def compute_intrinsic_reward(config, imagined_trajectories, imagined_actions, ensembles):
-    if config.intrinsic_reward == "random_network_distillation":
+def compute_intrinsic_reward(cfg, imagined_trajectories, imagined_actions, world_model, ensembles=None):
+    if cfg.algo.intrinsic_reward == "curiosity":
+        return compute_curiosity_intrinsic_reward(cfg, imagined_trajectories, imagined_actions, world_model)
+    elif cfg.algo.intrinsic_reward == "random_network_distillation":
         pass
-    elif config.intrinsic_reward == "plan2explore":
-        return compute_plan2explore_intrinsic_reward(imagined_trajectories, imagined_actions, ensembles)
+    elif cfg.algo.intrinsic_reward == "progress":
+        pass
+    elif cfg.algo.intrinsic_reward == "plan2explore":
+        return compute_plan2explore_intrinsic_reward(cfg, imagined_trajectories, imagined_actions, ensembles)
     else:
-        raise ValueError(f"Unknown intrinsic reward type: {config.intrinsic_reward}")
+        raise ValueError(f"Unknown intrinsic reward type: {cfg.algo.intrinsic_reward}")
+
+#curiosity
+def compute_curiosity_intrinsic_reward(cfg, imagined_trajectories, imagined_actions, world_model):
+    # 1. 현재 상태와 행동으로 다음 상태 예측
+    current_states = imagined_trajectories[:-1]  # 마지막 상태 제외
+    next_states = imagined_trajectories[1:]      # 첫 상태 제외
+    
+    predicted_next_states = world_model.transition_model(current_states, imagined_actions[:-1])
+    
+    # 2. 예측 오차 계산
+    prediction_error = F.mse_loss(predicted_next_states, next_states, reduction='none')
+    
+    # 3. 예측 오차를 내재적 보상으로 사용
+    intrinsic_reward = prediction_error.mean(dim=-1, keepdim=True)
+    
+    # 보상 스케일링 
+    if hasattr(cfg.algo, 'curiosity_reward_scale'):
+        intrinsic_reward *= cfg.algo.curiosity_reward_scale
+    
+    return intrinsic_reward
 
 def compute_plan2explore_intrinsic_reward(cfg,imagined_trajectories, imagined_actions, ensembles):
     next_state_embedding = torch.empty(
@@ -62,7 +87,6 @@ def compute_plan2explore_intrinsic_reward(cfg,imagined_trajectories, imagined_ac
     intrinsic_reward = next_state_embedding.var(0).mean(-1, keepdim=True) * cfg.algo.intrinsic_reward_multiplier
     return intrinsic_reward
 
-
 def train(
     fabric: Fabric,
     world_model: WorldModel,
@@ -75,8 +99,6 @@ def train(
     data: Dict[str, Tensor],
     aggregator: MetricAggregator,
     cfg: DictConfig,
-    ensembles: _FabricModule,
-    ensemble_optimizer: _FabricOptimizer,
     actor_exploration: _FabricModule,
     critics_exploration: Dict[str, Dict[str, Any]],
     actor_exploration_optimizer: _FabricOptimizer,
@@ -84,6 +106,8 @@ def train(
     moments_task: Moments,
     is_continuous: bool,
     actions_dim: Sequence[int],
+    ensembles: Optional[_FabricModule] = None,
+    ensemble_optimizer: Optional[_FabricOptimizer] = None,
 ) -> None:
     """Runs one-step update of the agent.
 
@@ -238,33 +262,33 @@ def train(
     del recurrent_state
     del posterior_logits
     world_optimizer.zero_grad(set_to_none=True)
-
-    # Ensemble Learning
-    loss = 0.0
-    ensemble_optimizer.zero_grad(set_to_none=True)
-    for ens in ensembles:
-        out = ens(
-            torch.cat(
-                (
-                    posteriors.view(*posteriors.shape[:-2], -1).detach(), #torch.Size([64, 16, 1024])
-                    recurrent_states.detach(), 
-                    data["actions"].detach(),
-                ),
-                -1,
-            )
-        )[:-1]
-        next_state_embedding_dist = MSEDistribution(out, 1)
-        loss -= next_state_embedding_dist.log_prob(posteriors.view(sequence_length, batch_size, -1).detach()[1:]).mean()
-    loss.backward()
-    ensemble_grad = None
-    if cfg.algo.ensembles.clip_gradients is not None and cfg.algo.ensembles.clip_gradients > 0:
-        ensemble_grad = fabric.clip_gradients(
-            module=ens,
-            optimizer=ensemble_optimizer,
-            max_norm=cfg.algo.ensembles.clip_gradients,
-            error_if_nonfinite=False,
-        )
-    ensemble_optimizer.step()
+    if cfg.algo.intrinsic_reward == 'plan2explore':
+        # Ensemble Learning
+        loss = 0.0
+        ensemble_optimizer.zero_grad(set_to_none=True)
+        for ens in ensembles:
+            out = ens(
+                torch.cat(
+                    (
+                        posteriors.view(*posteriors.shape[:-2], -1).detach(), #torch.Size([64, 16, 1024])
+                        recurrent_states.detach(), 
+                        data["actions"].detach(),
+                    ),
+                    -1,
+                )
+            )[:-1]
+            next_state_embedding_dist = MSEDistribution(out, 1)
+            loss -= next_state_embedding_dist.log_prob(posteriors.view(sequence_length, batch_size, -1).detach()[1:]).mean()
+            loss.backward()
+            ensemble_grad = None
+            if cfg.algo.ensembles.clip_gradients is not None and cfg.algo.ensembles.clip_gradients > 0:
+                ensemble_grad = fabric.clip_gradients(
+                    module=ens,
+                    optimizer=ensemble_optimizer,
+                    max_norm=cfg.algo.ensembles.clip_gradients,
+                    error_if_nonfinite=False,
+                )
+            ensemble_optimizer.step()
 
     # Behaviour Learning Exploration
     # imagination이니깐 graident에서 분리하기 위해서 detatch 
@@ -338,7 +362,6 @@ def train(
         discount = torch.cumprod(continues * cfg.algo.gamma, dim=0) / cfg.algo.gamma
 
     actor_exploration_optimizer.zero_grad(set_to_none=True)
-    #....?
     policies: Sequence[Distribution] = actor_exploration(imagined_trajectories.detach())[1]
     #각 행동확률들에 대한 log_prob을 계산해서, 이걸 하나의 텐서로 sum. #log_probs = [-1.61, -0.69, -1.20] ->  sum(log_probs) = -1.61 + -0.69 + -1.20 = -3.50
     #이걸 Advantage에 곱해줌.. objective = -3.50 * 2.0 = -7.0 #policy_gradient
@@ -527,14 +550,17 @@ def train(
             "State/prior_entropy",
             Independent(OneHotCategorical(logits=priors_logits.detach()), 1).entropy().mean().detach(),
         )
-        aggregator.update("Loss/ensemble_loss", loss.detach().cpu())
+        if cfg.algo.intrinsic_reward == "plan2explore":
+            aggregator.update("Loss/ensemble_loss", loss.detach().cpu())
+            
         aggregator.update("Loss/policy_loss_exploration", policy_loss_exploration.detach())
         aggregator.update("Loss/policy_loss_task", policy_loss_task.detach())
         aggregator.update("Loss/value_loss_task", value_loss_task.detach())
         if world_model_grads:
             aggregator.update("Grads/world_model", world_model_grads.mean().detach())
-        if ensemble_grad:
-            aggregator.update("Grads/ensemble", ensemble_grad.detach())
+        if cfg.algo.intrinsic_reward == "plan2explore":
+            if ensemble_grad:
+                aggregator.update("Grads/ensemble", ensemble_grad.detach())
         if actor_grads_exploration:
             aggregator.update("Grads/actor_exploration", actor_grads_exploration.mean().detach())
         if actor_grads_task:
@@ -547,7 +573,9 @@ def train(
     actor_task_optimizer.zero_grad(set_to_none=True)
     critic_task_optimizer.zero_grad(set_to_none=True)
     world_optimizer.zero_grad(set_to_none=True)
-    ensemble_optimizer.zero_grad(set_to_none=True)
+    
+    if cfg.algo.intrinsic_reward == "plan2explore":
+        ensemble_optimizer.zero_grad(set_to_none=True)
     for c in critics_exploration.values():
         c["optimizer"].zero_grad(set_to_none=True)
             
@@ -665,30 +693,60 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
     critic_task_optimizer = hydra.utils.instantiate(
         cfg.algo.critic.optimizer, params=critic_task.parameters(), _convert_="all"
     )
-    ensemble_optimizer = hydra.utils.instantiate(
-        cfg.algo.critic.optimizer, params=ensembles.parameters(), _convert_="all"
+    if cfg.algo.intrinsic_reward == "plan2explore":
+        ensemble_optimizer = hydra.utils.instantiate(cfg.algo.critic.optimizer, params=ensembles.parameters(), _convert_="all"
     )
     if cfg.checkpoint.resume_from:
         world_optimizer.load_state_dict(state["world_optimizer"])
         actor_task_optimizer.load_state_dict(state["actor_task_optimizer"])
         critic_task_optimizer.load_state_dict(state["critic_task_optimizer"])
-        ensemble_optimizer.load_state_dict(state["ensemble_optimizer"])
+        if cfg.algo.intrinsic_reward == "plan2explore":
+            ensemble_optimizer.load_state_dict(state["ensemble_optimizer"])
         actor_exploration_optimizer.load_state_dict(state["actor_exploration_optimizer"])
         for k, c in critics_exploration.items():
             c["optimizer"].load_state_dict(state[f"critic_exploration_optimizer_{k}"])
-    (
+    
+    # (
+    #     world_optimizer,
+    #     actor_task_optimizer,
+    #     critic_task_optimizer,
+    #     ensemble_optimizer,
+    #     actor_exploration_optimizer,
+    # ) = fabric.setup_optimizers(
+    #     world_optimizer,
+    #     actor_task_optimizer,
+    #     critic_task_optimizer,
+    #     ensemble_optimizer,
+    #     actor_exploration_optimizer,
+    # )
+    optimizers_to_setup = [
         world_optimizer,
         actor_task_optimizer,
         critic_task_optimizer,
-        ensemble_optimizer,
         actor_exploration_optimizer,
-    ) = fabric.setup_optimizers(
-        world_optimizer,
-        actor_task_optimizer,
-        critic_task_optimizer,
-        ensemble_optimizer,
-        actor_exploration_optimizer,
-    )
+    ]
+
+    if cfg.algo.intrinsic_reward == "plan2explore":
+        optimizers_to_setup.insert(3, ensemble_optimizer)
+
+    setup_optimizers = fabric.setup_optimizers(*optimizers_to_setup)
+
+    if cfg.algo.intrinsic_reward == "plan2explore":
+        (
+            world_optimizer,
+            actor_task_optimizer,
+            critic_task_optimizer,
+            ensemble_optimizer,
+            actor_exploration_optimizer,
+        ) = setup_optimizers
+    else:
+        (
+            world_optimizer,
+            actor_task_optimizer,
+            critic_task_optimizer,
+            actor_exploration_optimizer,
+        ) = setup_optimizers
+    
     for k, critic in critics_exploration.items():
         critic["optimizer"] = fabric.setup_optimizers(critic["optimizer"])
 
@@ -945,58 +1003,66 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                     device=fabric.device,
                     from_numpy=cfg.buffer.from_numpy,
                 )
-                import pickle
-                import json
-                filename = f"sample_data_iter_{iter_num}.pkl"
-                sample_data_numpy = {key: value.cpu().numpy() if isinstance(value, torch.Tensor) else value for key, value in local_data.items()}
+                # import pickle
+                # import json
+                # filename = f"sample_data_iter_{iter_num}.pkl"
+                # sample_data_numpy = {key: value.cpu().numpy() if isinstance(value, torch.Tensor) else value for key, value in local_data.items()}
 
-                # 피클 형식으로 저장
-                with open(filename, 'wb') as f:
-                    pickle.dump(sample_data_numpy, f)
-                print(f"Sample data saved to {filename}")    
+                # # 피클 형식으로 저장
+                # with open(filename, 'wb') as f:
+                #     pickle.dump(sample_data_numpy, f)
+                # print(f"Sample data saved to {filename}")    
 
-                print(type(local_data))
+                # print(type(local_data))
                 
                 # Start training
                 with timer("Time/train_time", SumMetric, sync_on_compute=cfg.metric.sync_on_compute):
                     for i in range(per_rank_gradient_steps):
-                        # 누적 graident_steps에 도달할때마다 타겟 네트워크를 업데이트
+                        # 타겟 네트워크 업데이트 로직 (변경 없음)
                         if (
                             cumulative_per_rank_gradient_steps % cfg.algo.critic.per_rank_target_network_update_freq
                             == 0
                         ):
-                            tau = 1 if cumulative_per_rank_gradient_steps == 0 else cfg.algo.critic.tau #첫 번째 업데이트에서는 완전히 복사(tau=1)하고, 이후에는 설정된 tau 값을 사용
+                            tau = 1 if cumulative_per_rank_gradient_steps == 0 else cfg.algo.critic.tau
                             for cp, tcp in zip(critic_task.module.parameters(), target_critic_task.parameters()):
-                                tcp.data.copy_(tau * cp.data + (1 - tau) * tcp.data) #태스크용 크리틱의 파라미터를 타겟 네트워크로 소프트 업데이트
+                                tcp.data.copy_(tau * cp.data + (1 - tau) * tcp.data)
                             for k in critics_exploration.keys():
                                 for cp, tcp in zip(
                                     critics_exploration[k]["module"].module.parameters(),
                                     critics_exploration[k]["target_module"].parameters(),
                                 ):
                                     tcp.data.copy_(tau * cp.data + (1 - tau) * tcp.data)
-                        batch = {k: v[i].float() for k, v in local_data.items()} #torch.Size([64, 16, 3, 64, 64])
-                        train(
-                            fabric,
-                            world_model,
-                            actor_task,
-                            critic_task,
-                            target_critic_task,
-                            world_optimizer,
-                            actor_task_optimizer,
-                            critic_task_optimizer,
-                            batch,
-                            aggregator,
-                            cfg,
-                            ensembles=ensembles,
-                            ensemble_optimizer=ensemble_optimizer,
-                            actor_exploration=actor_exploration,
-                            critics_exploration=critics_exploration,
-                            actor_exploration_optimizer=actor_exploration_optimizer,
-                            is_continuous=is_continuous,
-                            actions_dim=actions_dim,
-                            moments_exploration=moments_exploration,
-                            moments_task=moments_task,
-                        )
+                        
+                        batch = {k: v[i].float() for k, v in local_data.items()}
+                        
+                        # train 함수 호출 부분을 조건부로 수정
+                        train_args = {
+                            "fabric": fabric,
+                            "world_model": world_model,
+                            "actor_task": actor_task,
+                            "critic_task": critic_task,
+                            "target_critic_task": target_critic_task,
+                            "world_optimizer": world_optimizer,
+                            "actor_task_optimizer": actor_task_optimizer,
+                            "critic_task_optimizer": critic_task_optimizer,
+                            "data": batch,
+                            "aggregator": aggregator,
+                            "cfg": cfg,
+                            "actor_exploration": actor_exploration,
+                            "critics_exploration": critics_exploration,
+                            "actor_exploration_optimizer": actor_exploration_optimizer,
+                            "is_continuous": is_continuous,
+                            "actions_dim": actions_dim,
+                            "moments_exploration": moments_exploration,
+                            "moments_task": moments_task,
+                        }
+
+                        if cfg.algo.intrinsic_reward == "plan2explore":
+                            train_args["ensembles"] = ensembles
+                            train_args["ensemble_optimizer"] = ensemble_optimizer
+
+                        train(**train_args)
+                        
                         cumulative_per_rank_gradient_steps += 1
                     train_step += world_size
 
@@ -1053,11 +1119,9 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                 "actor_task": actor_task.state_dict(),
                 "critic_task": critic_task.state_dict(),
                 "target_critic_task": target_critic_task.state_dict(),
-                "ensembles": ensembles.state_dict(),
                 "world_optimizer": world_optimizer.state_dict(),
                 "actor_task_optimizer": actor_task_optimizer.state_dict(),
                 "critic_task_optimizer": critic_task_optimizer.state_dict(),
-                "ensemble_optimizer": ensemble_optimizer.state_dict(),
                 "ratio": ratio.state_dict(),
                 "iter_num": iter_num * world_size,
                 "batch_size": cfg.algo.per_rank_batch_size * world_size,
@@ -1068,6 +1132,10 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
                 "moments_task": moments_task.state_dict(),
                 **critics_exploration_state,
             }
+            if cfg.algo.intrinsic_reward == "plan2explore":
+                state["ensembles"] = ensembles.state_dict()
+                state["ensemble_optimizer"] = ensemble_optimizer.state_dict()
+
             ckpt_path = log_dir + f"/checkpoint/ckpt_{policy_step}_{fabric.global_rank}.ckpt"
             fabric.call(
                 "on_checkpoint_coupled",
@@ -1088,16 +1156,19 @@ def main(fabric: Fabric, cfg: Dict[str, Any]):
     if not cfg.model_manager.disabled and fabric.is_global_zero:
         from sheeprl.algos.dreamer_v1.utils import log_models
         from sheeprl.utils.mlflow import register_model
-
+        
         models_to_log = {
             "world_model": world_model,
-            "ensembles": ensembles,
             "actor_exploration": actor_exploration,
             "actor_task": actor_task,
             "critic_task": critic_task,
             "target_critic_task": target_critic_task,
             "moments_task": moments_task,
         }
+
+    if cfg.algo.intrinsic_reward == "plan2explore":
+        models_to_log["ensembles"] = ensembles
+
         critics_to_log = {}
         for k, v in critics_exploration.items():
             critics_to_log["critic_exploration_" + k] = v["module"]

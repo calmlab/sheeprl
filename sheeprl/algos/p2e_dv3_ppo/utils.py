@@ -4,7 +4,6 @@ from typing import TYPE_CHECKING, Any, Dict, Sequence
 
 import gymnasium as gym
 from lightning import Fabric
-import torch
 
 from sheeprl.algos.dreamer_v3.utils import AGGREGATOR_KEYS as AGGREGATOR_KEYS_DV3
 from sheeprl.algos.dreamer_v3.utils import Moments
@@ -147,53 +146,3 @@ def log_models_from_checkpoint(
                 )
         mlflow.log_dict(cfg.to_log, "config.json")
     return model_info
-
-
-def compute_intrinsic_reward(cfg, imagined_trajectories, imagined_actions, world_model, ensembles=None):
-    if cfg.algo.intrinsic_reward == "curiosity":
-        return compute_curiosity_intrinsic_reward(cfg, imagined_trajectories, imagined_actions, world_model)
-    elif cfg.algo.intrinsic_reward == "random_network_distillation":
-        pass
-    elif cfg.algo.intrinsic_reward == "progress":
-        pass
-    elif cfg.algo.intrinsic_reward == "plan2explore":
-        return compute_plan2explore_intrinsic_reward(cfg, imagined_trajectories, imagined_actions, ensembles)
-    else:
-        raise ValueError(f"Unknown intrinsic reward type: {cfg.algo.intrinsic_reward}")
-
-#curiosity
-def compute_curiosity_intrinsic_reward(cfg, imagined_trajectories, imagined_actions, world_model):
-    # 1. 현재 상태와 행동으로 다음 상태 예측
-    current_states = imagined_trajectories[:-1]  # 마지막 상태 제외
-    next_states = imagined_trajectories[1:]      # 첫 상태 제외
-    
-    predicted_next_states = world_model.transition_model(current_states, imagined_actions[:-1])
-    
-    # 2. 예측 오차 계산
-    prediction_error = F.mse_loss(predicted_next_states, next_states, reduction='none')
-    
-    # 3. 예측 오차를 내재적 보상으로 사용
-    intrinsic_reward = prediction_error.mean(dim=-1, keepdim=True)
-    
-    # 보상 스케일링 
-    if hasattr(cfg.algo, 'curiosity_reward_scale'):
-        intrinsic_reward *= cfg.algo.curiosity_reward_scale
-    
-    return intrinsic_reward
-
-def compute_plan2explore_intrinsic_reward(cfg,imagined_trajectories, imagined_actions, ensembles):
-    next_state_embedding = torch.empty(
-        len(ensembles),
-        cfg.algo.horizon + 1,
-        cfg.batch_size * cfg.sequence_length,
-        cfg.stochastic_size * cfg.discrete_size,
-        device=cfg.device,
-    )
-    for i, ens in enumerate(ensembles):
-        next_state_embedding[i] = ens(
-            torch.cat((imagined_trajectories.detach(), imagined_actions.detach()), -1)
-        )
-    
-    # Compute intrinsic reward as the variance of ensemble predictions
-    intrinsic_reward = next_state_embedding.var(0).mean(-1, keepdim=True) * cfg.algo.intrinsic_reward_multiplier
-    return intrinsic_reward
