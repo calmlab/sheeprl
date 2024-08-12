@@ -27,11 +27,11 @@ class UnityWrapper(UnityToGymWrapper):
     def _convert_obs(self, obs: Union[np.ndarray, Dict[str, np.ndarray]]) -> Dict[str, np.ndarray]:
         return {"rgb": obs}
 
-
     def step(self, action: Any) -> Tuple[Any, SupportsFloat, bool, bool, Dict[str, Any]]:
         obs, reward, done, info = super().step(action)
         if obs.dtype == np.float32:
             obs = (obs * 255).astype(np.uint8)
+        obs = np.transpose(obs, (1, 2, 0))
         return obs, reward, done, False, info
 
     def reset(
@@ -40,5 +40,13 @@ class UnityWrapper(UnityToGymWrapper):
         obs = super().reset()
         if obs.dtype == np.float32:
             obs = (obs * 255).astype(np.uint8)
+        obs = np.transpose(obs, (1, 2, 0))
         return obs, {}
 
+    def render(self):
+        obs = super().render()
+        if obs is not None:
+            if obs.dtype == np.float32:
+                obs = (obs * 255).astype(np.uint8)
+            obs = np.transpose(obs, (1, 2, 0))
+        return obs

@@ -121,7 +121,6 @@ class PPOAgent(nn.Module):
             unimix=cfg.algo.unimix,
         )
 
-
         #입력은 특징(features)이고, 출력은 단일 값(가치 추정치), 
         self.critic = MLP(
             input_dims=latent_state_size,
@@ -220,45 +219,6 @@ class PPOAgent(nn.Module):
             all_entropies,             # [sequence_length, batch_size, 1]
             all_values                 # [sequence_length, batch_size, ...]
         )
-        
-    # def forward(
-    #     self, latent_state: Tensor, actions: Optional[List[Tensor]] = None
-    # ) -> Tuple[Sequence[Tensor], Tensor, Tensor, Tensor]:
-    #     actor_out, action_dists = self.actor(latent_state)
-    #     values = self.critic(latent_state)
-        
-    #     if self.is_continuous:
-    #         if self.distribution == "normal":
-    #             actions, log_prob, entropy = self._normal(actor_out[0], actions)
-    #         elif self.distribution == "tanh_normal":
-    #             actions, log_prob, entropy = self._tanh_normal(actor_out[0], actions)
-    #         return tuple([actions]), log_prob, entropy, values
-    #     else:
-    #         # should_append가 discrete action space에서 새로운 행동을 샘플링해야하는지에 대한 여부를 확인.
-    #         should_append = False
-    #         actions_logprobs: List[Tensor] = []
-    #         actions_entropies: List[Tensor] = []
-    #         actions_dist: List[Distribution] = action_dists
-    #         if actions is None:
-    #             should_append = True
-    #             actions = []
-            
-    #         for i, dist in enumerate(actions_dist):
-    #             actions_entropies.append(dist.entropy()) # 나중에 entropy bonus 등을 계산하기 위해서.
-    #             if should_append:
-    #                 actions.append(dist.sample())
-    #             log_prob = dist.log_prob(actions[i])
-    #             actions_logprobs.append(log_prob)
-            
-    #         if isinstance(actions, list):
-    #             actions = torch.cat(actions, dim=-1)
-            
-    #         return (
-    #             actions,
-    #             torch.stack(actions_logprobs, dim=-1).sum(dim=-1, keepdim=True),
-    #             torch.stack(actions_entropies, dim=-1).sum(dim=-1, keepdim=True),
-    #             values,
-    #         )
 
 class PPOPlayer(nn.Module):
     """
@@ -281,7 +241,7 @@ class PPOPlayer(nn.Module):
         self,
         encoder: MultiEncoder | _FabricModule,
         rssm: RSSM | DecoupledRSSM,
-        actor: PPOActor,
+        actor: Actor,
         actions_dim: Sequence[int],
         num_envs: int,
         stochastic_size: int,
@@ -678,7 +638,8 @@ def build_agent(
     if world_model_state:
         world_model.load_state_dict(world_model_state)
     if ppo_agent_state:
-        ppo_agent.actor.load_state_dict(ppo_agent_state)
+        # ppo_agent.actor.load_state_dict(ppo_agent_state)
+        ppo_agent.load_state_dict(ppo_agent_state)
 
     # Create the player agent
     fabric_player = get_single_device_fabric(fabric)

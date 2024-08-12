@@ -4,7 +4,7 @@
 SCRIPT_NAME=$(basename "$0" .sh)
 
 # nohup 명령을 실행하고 백그라운드로 보냅니다
-nohup python -u ../sheeprl.py exp=p2e_dv3_exploration \
+CUDA_VISIBLE_DEVICES=1 nohup python -u ../sheeprl.py exp=p2e_dv3_exploration \
                      env=unity_env \
                      env.num_envs=4 \
                      fabric.accelerator=cuda \
@@ -15,7 +15,7 @@ nohup python -u ../sheeprl.py exp=p2e_dv3_exploration \
                      metric.log_every=100 \
                      buffer.from_numpy=True \
                      buffer.size=100000 \
-                     env.wrapper.file_name=/home/calm04/data/sheeprl/unity_env/unity_linux_agent/Sample.x86_64 \
+                     env.wrapper.file_name=/home/calm04/data/sheeprl/unity_env/240808_agent/240808_agent.x86_64 \
                      > "${SCRIPT_NAME}.log" 2>&1 &
 
 # 방금 시작한 백그라운드 프로세스의 PID를 가져옵니다

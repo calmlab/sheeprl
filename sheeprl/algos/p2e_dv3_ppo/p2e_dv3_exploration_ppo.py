@@ -204,8 +204,8 @@ def train(
     # greedy = cfg.algo.deterministic_actions
     
     actions, _, _, _ = ppo_agent(latent_states.detach()) 
-    print("actions:",actions.shape)
-    print("latent_states:",latent_states.shape)
+    # print("actions:",actions.shape)
+    # print("latent_states:",latent_states.shape)
         
     # imagined_actions[0] = actions
 
@@ -240,15 +240,15 @@ def train(
         
     # Compute continues
     continues = Independent(BernoulliSafeMode(logits=world_model.continue_model(latent_states)), 1).mode
-    print(f"before_continues shape: {continues.shape}")   
+    # print(f"before_continues shape: {continues.shape}")   
     true_continue = (1 - data["terminated"])
-    print("true_continue:",true_continue.shape)
+    # print("true_continue:",true_continue.shape)
     continues = torch.cat((true_continue, continues[1:]))
     
-    print(f"reward shape: {reward.shape}")
-    print(f"values shape: {values.shape}")
-    print(f"continues shape: {continues.shape}")   
-    print(f"imagined_trajectories: {imagined_trajectories.shape}")
+    # print(f"reward shape: {reward.shape}")
+    # print(f"values shape: {values.shape}")
+    # print(f"continues shape: {continues.shape}")   
+    # print(f"imagined_trajectories: {imagined_trajectories.shape}")
     # reward shape: torch.Size([16, 512, 1])
     # values shape: torch.Size([16, 512, 1])
     # continues shape: torch.Size([16, 512, 1])
@@ -273,7 +273,7 @@ def train(
 
     ppo_agent_optimizer.zero_grad(set_to_none=True)
     
-    print("latent_states_shape:",latent_states.shape) #각 sequence_length, batch_size만큼의 5120 latent_state가 있다.
+    # print("latent_states_shape:",latent_states.shape) #각 sequence_length, batch_size만큼의 5120 latent_state가 있다.
     _, current_log_probs, entropy, current_values = ppo_agent(latent_states.detach())
 
     if old_ppo_agent is None:
@@ -293,8 +293,8 @@ def train(
     # PPO의 policy loss 계산
     ratio = torch.exp(current_log_probs - old_log_probs)
     
-    print("ratio:",ratio.shape)
-    print("advantages:",advantages.shape)
+    # print("ratio:",ratio.shape)
+    # print("advantages:",advantages.shape)
     
     surr1 = ratio * advantages
     

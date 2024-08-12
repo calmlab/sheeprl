@@ -11,11 +11,11 @@ player:
 
 critics_exploration:
   intrinsic:
-    weight: 0.1
-    reward_type: intrinsic
-  extrinsic:
     weight: 1.0
-    reward_type: task
+    reward_type: intrinsic
+  # extrinsic:
+  #   weight: 1.0
+  #   reward_type: task
 
 gae_lambda: 0.95
 ensembles:
