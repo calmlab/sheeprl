@@ -4,7 +4,7 @@
 SCRIPT_NAME=$(basename "$0" .sh)
 
 # nohup 명령을 실행하고 백그라운드로 보냅니다
-CUDA_VISIBLE_DEVICES=1 nohup python -u ../sheeprl.py exp=p2e_dv3_exploration \
+CUDA_VISIBLE_DEVICES=1 nohup python -u ../sheeprl.py exp=p2e_dv3_exploration_ppo \
                      env=unity_env \
                      env.num_envs=4 \
                      fabric.accelerator=cuda \

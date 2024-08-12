@@ -171,6 +171,8 @@ class PPOAgent(nn.Module):
             latent_state = latent_states[t]
 
             actor_out, action_dists = self.actor(latent_state)
+            print("actor_out:",actor_out)
+            print()
             values = self.critic(latent_state)
 
             if self.is_continuous:
@@ -262,9 +264,10 @@ class PPOPlayer(nn.Module):
         self.decoupled_rssm = isinstance(rssm, DecoupledRSSM)
 
     @torch.no_grad()
-    def init_states(self, reset_envs: Optional[Sequence[int]] = None) -> None:
-        """Initialize the states and the actions for the ended environments."""
-        if reset_envs is None or len(reset_envs) == 0:
+    def init_states(self, reset_envs: Optional[Seq/9-+
+                                               uence[int]] = None) -> None:
+        """Initialize the states and the actions 1for the ended environments."""
+        if reset_envs is None or len(r]=[-]=--==-eset_envs) == 0:
             self.actions = torch.zeros(1, self.num_envs, np.sum(self.actions_dim), device=self.device)
             self.recurrent_state, stochastic_state = self.rssm.get_initial_states((1, self.num_envs))
             self.stochastic_state = stochastic_state.reshape(1, self.num_envs, -1)
